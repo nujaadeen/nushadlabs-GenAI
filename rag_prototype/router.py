@@ -27,7 +27,7 @@ import chromadb
 from sentence_transformers import SentenceTransformer
 
 import config
-from query import ask_ollama, build_prompt, retrieve
+from query import ask_ollama, retrieve
 from tools.analytics import (
     highest_demand_products,
     highest_discount_products,
@@ -153,6 +153,29 @@ def classify_intent(question: str) -> str:
     return "doc_rag"
 
 
+# ── Polite no-answer message ──────────────────────────────────────────────────
+
+# Phrases the LLM may produce when the context doesn't cover the question.
+_LLM_NO_ANSWER_PATTERNS = re.compile(
+    r"(cannot find that information|not in the provided context"
+    r"|i (don't|do not|couldn't|could not) (have|find)|unable to (find|answer)"
+    r"|no information (in|from|about)|not (enough|sufficient) information"
+    r"|i am not able to|the context (does not|doesn't) (contain|include|mention))",
+    re.I,
+)
+
+
+def _no_answer_msg(tenant_id: int) -> str:
+    """Return a polite fallback message, personalised with the tenant name if known."""
+    tenant = config.TENANT_REGISTRY.get(tenant_id)
+    name = f" at {tenant['name']}" if tenant else ""
+    return (
+        f"I'm sorry, I wasn't able to find any information regarding your inquiry{name}. "
+        "For further assistance, please contact our customer care team or send your "
+        "enquiry via email and we'll be happy to help you."
+    )
+
+
 # ── Analytics answer synthesis ────────────────────────────────────────────────
 
 _ANALYTICS_SYSTEM = (
@@ -183,9 +206,9 @@ def _format_rows(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _analytics_answer(question: str, rows: list[dict]) -> str:
+def _analytics_answer(question: str, rows: list[dict], tenant_id: int) -> str:
     if not rows:
-        return "No products found for that query."
+        return _no_answer_msg(tenant_id)
     prompt = _ANALYTICS_PROMPT.format(
         system=_ANALYTICS_SYSTEM,
         data=_format_rows(rows),
@@ -193,6 +216,42 @@ def _analytics_answer(question: str, rows: list[dict]) -> str:
     )
     answer, _ = ask_ollama(prompt)
     return answer
+
+
+# ── RAG system prompt (router variant) ───────────────────────────────────────
+# Overrides the "say so honestly" line from query.build_prompt so the LLM
+# produces the polite redirect instead of a blunt "I cannot find" reply.
+
+def _rag_system_prompt(tenant_id: int) -> str:
+    tenant = config.TENANT_REGISTRY.get(tenant_id)
+    if tenant:
+        intro = f"You are a knowledgeable assistant for {tenant['name']}, {tenant['description']}."
+    else:
+        intro = "You are a knowledgeable assistant."
+    no_answer = _no_answer_msg(tenant_id)
+    return (
+        f"{intro} "
+        "Answer the user's question using ONLY the context provided below. "
+        "Keep your answer concise.\n\n"
+        "CITATION RULE: For every factual claim that involves a specific number, name, or date, "
+        "quote the exact sentence from the context that supports it, in the form: "
+        "Answer ... (source: \"<exact quoted sentence from context>\"). "
+        f"If the context does not contain enough information to answer, reply with exactly:\n"
+        f"\"{no_answer}\"\n"
+        "Do NOT infer, estimate, or guess — only report what the context explicitly states."
+    )
+
+
+def _build_rag_prompt(question: str, chunks: list[str], tenant_id: int) -> str:
+    context_block = "\n\n---\n\n".join(
+        f"[Chunk {i+1}]\n{chunk}" for i, chunk in enumerate(chunks)
+    )
+    return (
+        f"{_rag_system_prompt(tenant_id)}\n\n"
+        f"=== CONTEXT ===\n{context_block}\n\n"
+        f"=== QUESTION ===\n{question}\n\n"
+        f"=== ANSWER ==="
+    )
 
 
 # ── RAG answer helpers ────────────────────────────────────────────────────────
@@ -203,13 +262,16 @@ def _rag_answer(
     tenant_id: int,
     model: SentenceTransformer,
     collection,
-    collection_label: str,
 ) -> str:
     chunks, _, _, _, _ = retrieve(question, model, collection, tenant_id)
     if not chunks:
-        return f"No relevant content found in {collection_label}."
-    prompt = build_prompt(question, chunks[: config.MAX_CONTEXT_CHUNKS], tenant_id)
+        return _no_answer_msg(tenant_id)
+    prompt = _build_rag_prompt(question, chunks[: config.MAX_CONTEXT_CHUNKS], tenant_id)
     answer, _ = ask_ollama(prompt)
+    # Guard: if the LLM still produces a "cannot find" variant, swap for the
+    # polite message so the response is always consistent.
+    if _LLM_NO_ANSWER_PATTERNS.search(answer):
+        return _no_answer_msg(tenant_id)
     return answer
 
 
@@ -228,17 +290,17 @@ def ask(question: str, tenant_id: int, limit: int = 5) -> str:
     if intent == "analytics_newest":
         rows = newest_products(tenant_id, limit)
         print(f"[router] SQL returned {len(rows)} row(s)")
-        return _analytics_answer(question, rows)
+        return _analytics_answer(question, rows, tenant_id)
 
     if intent == "analytics_discount":
         rows = highest_discount_products(tenant_id, limit)
         print(f"[router] SQL returned {len(rows)} row(s)")
-        return _analytics_answer(question, rows)
+        return _analytics_answer(question, rows, tenant_id)
 
     if intent == "analytics_demand":
         rows = highest_demand_products(tenant_id, limit)
         print(f"[router] SQL returned {len(rows)} row(s)")
-        return _analytics_answer(question, rows)
+        return _analytics_answer(question, rows, tenant_id)
 
     # ── RAG paths (embeddings + ChromaDB) ────────────────────────────────────
     model = SentenceTransformer(config.EMBED_MODEL)
@@ -248,17 +310,17 @@ def ask(question: str, tenant_id: int, limit: int = 5) -> str:
         try:
             collection = chroma.get_collection("products")
         except Exception:
-            return "Product index not found — run sync_products.py first."
+            return _no_answer_msg(tenant_id)
         print("[router] path=product_rag  (ChromaDB products collection)")
-        return _rag_answer(question, tenant_id, model, collection, "products")
+        return _rag_answer(question, tenant_id, model, collection)
 
     # doc_rag (default)
     try:
         collection = chroma.get_collection(config.COLLECTION_NAME)
     except Exception:
-        return f"Document index not found — run ingest.py first."
+        return _no_answer_msg(tenant_id)
     print(f"[router] path=doc_rag  (ChromaDB {config.COLLECTION_NAME} collection)")
-    return _rag_answer(question, tenant_id, model, collection, "docs")
+    return _rag_answer(question, tenant_id, model, collection)
 
 
 # ── CLI smoke-test ────────────────────────────────────────────────────────────
