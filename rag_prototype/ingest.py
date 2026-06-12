@@ -2,14 +2,15 @@
 ingest.py — Load all PDFs in the data folder, chunk by tokens, embed, and store in ChromaDB.
 
 Usage:
-    python ingest.py               (ingests every *.pdf in config.DATA_DIR)
-    python ingest.py --pdf PATH    (ingests a single specific PDF)
+    python ingest.py --tenant-id TENANT_ID               (ingests every *.pdf in config.DATA_DIR)
+    python ingest.py --tenant-id TENANT_ID --pdf PATH    (ingests a single specific PDF)
 """
 
 import argparse
 import logging
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import chromadb
@@ -168,40 +169,41 @@ def chunk_by_tokens(text: str, tokenizer, chunk_size: int, overlap: int) -> list
 # Stable chunk ID
 # ---------------------------------------------------------------------------
 
-def make_chunk_id(pdf_path: str, chunk_index: int) -> str:
-    """Deterministic ID so re-ingesting the same PDF is idempotent."""
+def make_chunk_id(pdf_path: str, chunk_index: int, tenant_id: int) -> str:
+    """Deterministic ID so re-ingesting the same PDF+tenant is idempotent."""
     stem = Path(pdf_path).stem
-    return f"{stem}_chunk_{chunk_index:05d}"
+    return f"{tenant_id}_{stem}_chunk_{chunk_index:05d}"
 
 
 # ---------------------------------------------------------------------------
 # Main ingestion pipeline
 # ---------------------------------------------------------------------------
 
-def ingest(pdf_paths: list[str]) -> None:
+def ingest(pdf_paths: list[str], tenant_id: int) -> None:
+    if not isinstance(tenant_id, int) or tenant_id < 1:
+        raise ValueError(f"tenant_id must be a positive integer, got {tenant_id!r}")
+
+    ingest_timestamp = datetime.now(timezone.utc).isoformat()
+
     # 1. Load embedding model once for all PDFs
     print(f"[ingest] Loading embedding model '{config.EMBED_MODEL}' …")
     model = SentenceTransformer(config.EMBED_MODEL)
     tokenizer = model.tokenizer
 
-    # 2. Connect to ChromaDB and recreate the collection fresh
+    # 2. Connect to ChromaDB — get or create the shared collection so other
+    #    tenants' data is never touched.
     print(f"[ingest] Storing in ChromaDB at '{config.CHROMA_DIR}' …")
     client = chromadb.PersistentClient(path=config.CHROMA_DIR)
-    try:
-        client.delete_collection(config.COLLECTION_NAME)
-        print(f"[ingest] Replaced existing collection '{config.COLLECTION_NAME}'")
-    except Exception:
-        pass
-    collection = client.create_collection(
+    collection = client.get_or_create_collection(
         name=config.COLLECTION_NAME,
         metadata={"hnsw:space": "cosine"},
     )
 
-    # 3. Process each PDF and add its chunks to the collection
+    # 3. Process each PDF and upsert its chunks (idempotent per tenant+file)
     total_chunks = 0
     first_pdf = True
     for pdf_path in pdf_paths:
-        print(f"\n[ingest] --- Processing: {pdf_path}")
+        print(f"\n[ingest] --- Processing: {pdf_path} (tenant: {tenant_id})")
         raw_text = load_pdf(pdf_path)
         if not raw_text.strip():
             print(f"[ingest] WARNING: No text extracted from '{pdf_path}' (skipping).")
@@ -228,10 +230,18 @@ def ingest(pdf_paths: list[str]) -> None:
         # Document embeddings are stored WITHOUT the BGE query instruction prefix.
         embeddings = model.encode(chunks, show_progress_bar=True, normalize_embeddings=True)
 
-        ids = [make_chunk_id(pdf_path, i) for i in range(len(chunks))]
-        metadatas = [{"source": Path(pdf_path).name, "chunk_index": i} for i in range(len(chunks))]
+        ids = [make_chunk_id(pdf_path, i, tenant_id) for i in range(len(chunks))]
+        metadatas = [
+            {
+                "tenant_id": tenant_id,
+                "source": Path(pdf_path).name,
+                "chunk_index": i,
+                "ingest_timestamp": ingest_timestamp,
+            }
+            for i in range(len(chunks))
+        ]
 
-        collection.add(
+        collection.upsert(
             ids=ids,
             embeddings=embeddings.tolist(),
             documents=chunks,
@@ -240,7 +250,7 @@ def ingest(pdf_paths: list[str]) -> None:
         total_chunks += len(chunks)
 
     print(f"\n[ingest] Done. {total_chunks} total chunks from {len(pdf_paths)} PDF(s) "
-          f"stored in collection '{config.COLLECTION_NAME}'.")
+          f"stored in collection '{config.COLLECTION_NAME}' under tenant '{tenant_id}'.")
 
 
 # ---------------------------------------------------------------------------
@@ -252,8 +262,10 @@ if __name__ == "__main__":
         description="Ingest PDFs into ChromaDB",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    parser.add_argument("--tenant-id", required=True, type=int, metavar="N",
+                        help="Tenant identifier (positive integer) — all ingested chunks are tagged with this ID")
     parser.add_argument("--pdf", default=None, metavar="PATH",
-                        help="Ingest a single PDF instead of the whole data folder")
+                        help="Ingest a single PDF instead of the tenant's resources folder")
     parser.add_argument("--chunk-size", type=int, default=None, metavar="N",
                         help=f"Tokens per chunk (config default: {config.CHUNK_SIZE})")
     parser.add_argument("--chunk-overlap", type=int, default=None, metavar="N",
@@ -276,13 +288,14 @@ if __name__ == "__main__":
             sys.exit(1)
         pdf_paths = [args.pdf]
     else:
-        data_dir = Path(config.DATA_DIR)
+        data_dir = Path(config.DATA_DIR) / f"tenant_{args.tenant_id}" / "resources"
         pdf_paths = sorted(data_dir.glob("*.pdf"))
         if not pdf_paths:
             print(f"[ingest] ERROR: No PDF files found in '{data_dir}'.")
+            print(f"         Expected path: {data_dir.resolve()}")
             sys.exit(1)
         print(f"[ingest] Found {len(pdf_paths)} PDF(s) in '{data_dir}':")
         for p in pdf_paths:
             print(f"         - {p.name}")
 
-    ingest([str(p) for p in pdf_paths])
+    ingest([str(p) for p in pdf_paths], tenant_id=args.tenant_id)

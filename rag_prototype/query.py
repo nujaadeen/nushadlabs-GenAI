@@ -112,11 +112,15 @@ def retrieve(
     question: str,
     model: SentenceTransformer,
     collection,
+    tenant_id: int,
     n_results: int | None = None,
 ) -> tuple[list[str], list[float], list[dict], float, float]:
     """
     Embed `question` (with BGE query instruction prefix), query ChromaDB for
     n_results (defaults to TOP_K).  Returns (chunks, distances, metadatas, embed_ms, search_ms).
+
+    Every query is hard-filtered to tenant_id — there is no code path that
+    queries without this filter.
     """
     if n_results is None:
         n_results = config.TOP_K
@@ -133,6 +137,7 @@ def retrieve(
     results = collection.query(
         query_embeddings=q_embedding.tolist(),
         n_results=n_results,
+        where={"tenant_id": tenant_id},
         include=["documents", "distances", "metadatas"],
     )
     search_ms = (time.perf_counter() - t1) * 1000
@@ -143,7 +148,12 @@ def retrieve(
     return chunks, distances, metadatas, embed_ms, search_ms
 
 
-def retrieve_multi(sub_questions: list[str], model: SentenceTransformer, collection) -> tuple[list[str], list[float], list[dict], float, float]:
+def retrieve_multi(
+    sub_questions: list[str],
+    model: SentenceTransformer,
+    collection,
+    tenant_id: int,
+) -> tuple[list[str], list[float], list[dict], float, float]:
     """
     Retrieve top-3 chunks per sub-question, merge, and de-duplicate by chunk text.
     Returns the same shape as retrieve().
@@ -154,7 +164,7 @@ def retrieve_multi(sub_questions: list[str], model: SentenceTransformer, collect
 
     for sub_q in sub_questions:
         chunks, distances, metadatas, embed_ms, search_ms = retrieve(
-            sub_q, model, collection, n_results=config.COMPOUND_K
+            sub_q, model, collection, tenant_id, n_results=config.COMPOUND_K
         )
         total_embed_ms += embed_ms
         total_search_ms += search_ms
@@ -174,29 +184,36 @@ def retrieve_multi(sub_questions: list[str], model: SentenceTransformer, collect
 # Prompt construction
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = (
-    "You are a knowledgeable assistant for NovaSpark Technologies. "
-    "Answer the user's question using ONLY the context provided below. "
-    "Keep your answer concise.\n\n"
-    "CITATION RULE: For every factual claim that involves a specific number, name, or date, "
-    "you MUST quote the exact sentence from the context that supports it, in the form: "
-    "Answer ... (source: \"<exact quoted sentence from context>\"). "
-    "If no sentence in the context states the fact, say exactly: "
-    "\"I cannot find that information in the provided context.\" "
-    "Do NOT infer, estimate, or guess numbers — only report what the context explicitly states.\n\n"
-    "When the user describes a business need or data challenge, explicitly recommend "
-    "the most relevant NovaSpark product from the context and explain WHY it fits — "
-    "do not hedge with 'it depends' when the context makes a clear recommendation possible.\n"
-    "If the context genuinely does not contain enough information to answer, say so honestly."
-)
+def _build_system_prompt(tenant_id: int | None) -> str:
+    tenant = config.TENANT_REGISTRY.get(tenant_id) if tenant_id is not None else None
+    if tenant:
+        intro = f"You are a knowledgeable assistant for {tenant['name']}, {tenant['description']}."
+    else:
+        intro = "You are a knowledgeable assistant."
+
+    return (
+        f"{intro} "
+        "Answer the user's question using ONLY the context provided below. "
+        "Keep your answer concise.\n\n"
+        "CITATION RULE: For every factual claim that involves a specific number, name, or date, "
+        "you MUST quote the exact sentence from the context that supports it, in the form: "
+        "Answer ... (source: \"<exact quoted sentence from context>\"). "
+        "If no sentence in the context states the fact, say exactly: "
+        "\"I cannot find that information in the provided context.\" "
+        "Do NOT infer, estimate, or guess numbers — only report what the context explicitly states.\n\n"
+        "When the user describes a need, explicitly recommend the most relevant product or service "
+        "from the context and explain WHY it fits — "
+        "do not hedge with 'it depends' when the context makes a clear recommendation possible.\n"
+        "If the context genuinely does not contain enough information to answer, say so honestly."
+    )
 
 
-def build_prompt(question: str, chunks: list[str]) -> str:
+def build_prompt(question: str, chunks: list[str], tenant_id: int | None = None) -> str:
     context_block = "\n\n---\n\n".join(
         f"[Chunk {i+1}]\n{chunk}" for i, chunk in enumerate(chunks)
     )
     return (
-        f"{SYSTEM_PROMPT}\n\n"
+        f"{_build_system_prompt(tenant_id)}\n\n"
         f"=== CONTEXT ===\n{context_block}\n\n"
         f"=== QUESTION ===\n{question}\n\n"
         f"=== ANSWER ==="
@@ -248,7 +265,7 @@ def ask_ollama(prompt: str) -> tuple[str, float]:
 # Single question handler
 # ---------------------------------------------------------------------------
 
-def answer_question(question: str, model: SentenceTransformer, collection) -> None:
+def answer_question(question: str, model: SentenceTransformer, collection, tenant_id: int) -> None:
     _hr("═")
     print(f"QUESTION: {question}")
     _hr("═")
@@ -260,11 +277,22 @@ def answer_question(question: str, model: SentenceTransformer, collection) -> No
 
     # --- Retrieval (with timing) ---
     if is_compound:
-        chunks, distances, metadatas, embed_ms, search_ms = retrieve_multi(sub_questions, model, collection)
+        chunks, distances, metadatas, embed_ms, search_ms = retrieve_multi(sub_questions, model, collection, tenant_id)
     else:
-        chunks, distances, metadatas, embed_ms, search_ms = retrieve(question, model, collection)
+        chunks, distances, metadatas, embed_ms, search_ms = retrieve(question, model, collection, tenant_id)
 
     retrieved_count = len(chunks)
+
+    if retrieved_count == 0:
+        print(
+            f"\n[query] WARNING: 0 chunks found for tenant_id='{tenant_id}'.\n"
+            f"         Possible causes:\n"
+            f"           1. Tenant ID mismatch — ingest used a different ID "
+            f"(e.g. 'tenant_2') than the one passed here ('{tenant_id}').\n"
+            f"           2. No data has been ingested yet for this tenant.\n"
+            f"         Fix: run  python ingest.py --tenant-id {tenant_id}"
+        )
+        return
 
     # Cap the context sent to the LLM (biggest single latency and grounding win).
     chunks    = chunks[:config.MAX_CONTEXT_CHUNKS]
@@ -288,7 +316,7 @@ def answer_question(question: str, model: SentenceTransformer, collection) -> No
             print(textwrap.fill(line, width=_WRAP) if line.strip() else "")
 
     # --- Prompt ---
-    prompt = build_prompt(question, chunks)
+    prompt = build_prompt(question, chunks, tenant_id)
     print(f"\n{'─'*_WRAP}")
     print("PROMPT SENT TO LLM")
     print(f"{'─'*_WRAP}")
@@ -322,6 +350,8 @@ def main() -> None:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("question", nargs="?", default=None, help="Question to ask")
+    parser.add_argument("--tenant-id", required=True, type=int, metavar="N",
+                        help="Tenant identifier (positive integer) — restricts retrieval to this tenant's data only")
     parser.add_argument("--top-k", type=int, default=None, metavar="N",
                         help=f"Chunks to retrieve (config default: {config.TOP_K})")
     parser.add_argument("--max-context-chunks", type=int, default=None, metavar="N",
@@ -354,18 +384,18 @@ def main() -> None:
               f"({collection.count()} chunks).\n")
     except Exception:
         print(f"[query] ERROR: Collection '{config.COLLECTION_NAME}' not found.")
-        print(f"         Run `python ingest.py` first.")
+        print(f"         Run `python ingest.py --tenant-id TENANT_ID` first.")
         sys.exit(1)
 
     if args.question:
-        answer_question(args.question, model, collection)
+        answer_question(args.question, model, collection, tenant_id=args.tenant_id)
     else:
         print("Interactive mode — type your question and press Enter. Ctrl-C to quit.\n")
         try:
             while True:
                 q = input("Question> ").strip()
                 if q:
-                    answer_question(q, model, collection)
+                    answer_question(q, model, collection, tenant_id=args.tenant_id)
         except (KeyboardInterrupt, EOFError):
             print("\n[query] Bye.")
 
