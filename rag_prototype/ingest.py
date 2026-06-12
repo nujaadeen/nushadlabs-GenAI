@@ -7,6 +7,7 @@ Usage:
 """
 
 import argparse
+import logging
 import re
 import sys
 from pathlib import Path
@@ -16,6 +17,11 @@ import fitz  # PyMuPDF
 from sentence_transformers import SentenceTransformer
 
 import config
+
+# Suppress the "[transformers] Token indices sequence length > 512" warning that fires
+# when chunk_by_tokens encodes the *full* PDF text before slicing.  Individual chunks
+# are always ≤ _MAX_EMBED_TOKENS, so the warning is spurious for the chunking use case.
+logging.getLogger("transformers.tokenization_utils_base").setLevel(logging.ERROR)
 
 
 # ---------------------------------------------------------------------------
@@ -45,8 +51,9 @@ def load_pdf(path: str) -> str:
 # Examples fixed:
 #   "99. 9 %"  → "99.9%"
 #   "$ 1, 999" → "$1,999"
+#   "1, 400 +" → "1,400+"
+#   "$ 0. 12"  → "$0.12"
 #   "1 ,234"   → "1,234"
-#   "2 0 2 5"  → (left alone — not matched; would need digit-run heuristic)
 _CLEANUP_RULES: list[tuple[str, str]] = [
     # currency symbol followed by optional space then digits: "$ 1,999" → "$1,999"
     (r"(\$)\s+(\d)", r"\1\2"),
@@ -56,6 +63,8 @@ _CLEANUP_RULES: list[tuple[str, str]] = [
     (r"(\d)\s+(%)", r"\1\2"),
     # digit, space, comma, space, digit (thousands separator): "1 , 000" → "1,000"
     (r"(\d)\s*,\s*(\d)", r"\1,\2"),
+    # digit, space(s), plus sign: "1,400 +" → "1,400+"
+    (r"(\d)\s+\+", r"\1+"),
 ]
 
 
@@ -68,24 +77,69 @@ def clean_text(text: str) -> str:
 
 
 def _sample_before_after(raw: str, cleaned: str, n_chars: int = 600) -> None:
-    """Log a side-by-side sample showing what the cleanup changed."""
+    """Log a before/after sample anchored on the first line that contains a number symbol."""
     print("\n[ingest] ── Text cleanup sample ──────────────────────────────────")
-    print("[ingest] BEFORE (first 600 chars):")
-    print(raw[:n_chars])
-    print("\n[ingest] AFTER  (first 600 chars):")
-    print(cleaned[:n_chars])
-    # highlight actual differences
-    changed = [(i, a, b) for i, (a, b) in enumerate(zip(raw, cleaned)) if a != b]
-    if changed:
-        print(f"\n[ingest] {len(changed)} character(s) changed by cleanup.")
+
+    # Prefer a window that actually shows number cleanup in action.
+    # Search for the first line containing '%', '$', or a digit followed by '+'.
+    anchor = -1
+    for sym in ("%", "$"):
+        pos = raw.find(sym)
+        if pos != -1 and (anchor == -1 or pos < anchor):
+            anchor = pos
+    # also check digit+space+plus pattern
+    m = re.search(r"\d\s+\+", raw)
+    if m and (anchor == -1 or m.start() < anchor):
+        anchor = m.start()
+
+    if anchor != -1:
+        start = max(0, raw.rfind("\n", 0, anchor) + 1)
+        label = "600 chars from first line containing a number/symbol"
     else:
-        print("\n[ingest] No changes in the first 600 chars (artefacts may appear later).")
+        start = 0
+        label = "first 600 chars (no number symbols found)"
+
+    before_sample = raw[start:start + n_chars]
+    after_sample  = cleaned[start:start + n_chars]
+
+    print(f"[ingest] BEFORE ({label}):")
+    print(before_sample)
+    print(f"\n[ingest] AFTER  ({label}):")
+    print(after_sample)
+
+    changed = sum(1 for a, b in zip(before_sample, after_sample) if a != b)
+    if changed:
+        print(f"\n[ingest] {changed} character(s) changed by cleanup in this sample.")
+    else:
+        print("\n[ingest] No changes in this sample (artefacts may appear elsewhere).")
     print("[ingest] ────────────────────────────────────────────────────────\n")
 
 
 # ---------------------------------------------------------------------------
 # Token-based chunking
 # ---------------------------------------------------------------------------
+
+# Hard limit: bge-small-en-v1.5 max_seq_length=512 (includes [CLS]+[SEP]),
+# so content must fit in 510 tokens to avoid the "> 512" truncation warning.
+_MAX_EMBED_TOKENS = 510
+
+
+def enforce_max_tokens(chunks: list[str], tokenizer) -> list[str]:
+    """Hard-split any chunk that exceeds _MAX_EMBED_TOKENS before embedding."""
+    result: list[str] = []
+    for chunk in chunks:
+        ids = tokenizer.encode(chunk, add_special_tokens=False)
+        if len(ids) <= _MAX_EMBED_TOKENS:
+            result.append(chunk)
+        else:
+            for start in range(0, len(ids), _MAX_EMBED_TOKENS):
+                sub = tokenizer.decode(
+                    ids[start:start + _MAX_EMBED_TOKENS], skip_special_tokens=True
+                ).strip()
+                if sub:
+                    result.append(sub)
+    return result
+
 
 def chunk_by_tokens(text: str, tokenizer, chunk_size: int, overlap: int) -> list[str]:
     """
@@ -162,7 +216,13 @@ def ingest(pdf_paths: list[str]) -> None:
 
         print(f"[ingest] Chunking (size={config.CHUNK_SIZE} tokens, overlap={config.CHUNK_OVERLAP}) …")
         chunks = chunk_by_tokens(text, tokenizer, config.CHUNK_SIZE, config.CHUNK_OVERLAP)
-        print(f"[ingest] Created {len(chunks)} chunks")
+        # Cleanup must run again AFTER decode because the tokenizer re-introduces spacing
+        # artefacts (e.g. "$1,999" encodes to ["$","1",",","999"] then decodes to "$ 1, 999").
+        chunks = [clean_text(chunk) for chunk in chunks]
+        chunks = enforce_max_tokens(chunks, tokenizer)
+        token_lengths = [len(tokenizer.encode(c, add_special_tokens=False)) for c in chunks]
+        print(f"[ingest] Created {len(chunks)} chunks  "
+              f"(max token length: {max(token_lengths)} / {_MAX_EMBED_TOKENS} — no truncation warning)")
 
         print(f"[ingest] Embedding {len(chunks)} chunks …")
         # Document embeddings are stored WITHOUT the BGE query instruction prefix.

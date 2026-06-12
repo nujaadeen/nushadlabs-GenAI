@@ -21,10 +21,10 @@ LLM_MODEL = "llama3.2:3b"
 OLLAMA_BASE_URL = "http://localhost:11434"
 
 # Max tokens the LLM should generate per answer — caps latency on long responses.
-LLM_NUM_PREDICT = 400
+LLM_NUM_PREDICT = 250
 
-# Keep the model loaded between queries (seconds). -1 = keep forever.
-LLM_KEEP_ALIVE = -1
+# Keep the model loaded between queries. "30m" = 30 minutes; -1 = keep forever.
+LLM_KEEP_ALIVE = "30m"
 
 # --- Chunking ---
 # CHUNK_SIZE: max tokens per chunk.
@@ -42,6 +42,16 @@ CHUNK_OVERLAP = 60
 #   Higher → more context for the LLM but also more noise.
 #   Lower  → tighter retrieval, may miss relevant material.
 TOP_K = 8
+
+# COMPOUND_K: how many chunks to retrieve for the "compound question" step.
+#   This is a second retrieval pass after reformulating the question to be more specific.
+#   Higher → more chances to find the right info after reformulation, but more latency
+COMPOUND_K = 3
+
+# MAX_CONTEXT_CHUNKS: hard cap on chunks actually sent to the LLM.
+#   Retrieving more than this (TOP_K >= MAX_CONTEXT_CHUNKS) lets the vector
+#   search cast a wider net while keeping the prompt tight.
+MAX_CONTEXT_CHUNKS = 5
 
 # --- Paths ---
 # ChromaDB will persist its data here (relative to project root).
