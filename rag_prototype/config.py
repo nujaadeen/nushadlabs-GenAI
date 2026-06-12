@@ -62,3 +62,21 @@ DATA_DIR = "./data"
 
 # ChromaDB collection name – change if you want separate collections per doc.
 COLLECTION_NAME = "rag_docs"
+
+# --- Tenant registry ---
+# Maps integer tenant IDs to display metadata used in system prompts.
+# Add a new entry here whenever you onboard a new business.
+TENANT_REGISTRY: dict[int, dict] = {
+    1: {
+        "name": "NovaSpark Technologies",
+        "description": "a B2B data infrastructure and AI software company",
+    },
+    2: {
+        "name": "FreshMart Grocery Co.",
+        "description": "a regional grocery chain offering fresh produce, home delivery, and loyalty rewards",
+    },
+    3: {
+        "name": "Grain & Glory Artisan Bakery",
+        "description": "an artisan bakery and patisserie specialising in sourdough, viennoiserie, and custom cakes",
+    },
+}
