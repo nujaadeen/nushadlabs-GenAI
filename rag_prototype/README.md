@@ -3,9 +3,9 @@
 A minimal, fully local Retrieval-Augmented Generation system built from raw components — no LangChain, no LlamaIndex.
 
 ```
-PDF  →  pypdf  →  token-chunks  →  sentence-transformers  →  ChromaDB
-                                                                  ↓
-Question  →  embed  →  top-k retrieve  →  prompt  →  Ollama  →  Answer
+PDF  →  PyMuPDF  →  cleanup  →  token-chunks  →  sentence-transformers  →  ChromaDB
+                                                                                ↓
+Question  →  BGE-prefixed embed  →  top-k retrieve  →  prompt  →  Ollama  →  Answer
 ```
 
 ---
@@ -16,7 +16,7 @@ Question  →  embed  →  top-k retrieve  →  prompt  →  Ollama  →  Answer
 |------|---------|
 | Python 3.10+ | [python.org](https://python.org) |
 | Ollama | [ollama.com](https://ollama.com) |
-| llama3.1:8b | `ollama pull llama3.1:8b` |
+| llama3.2:3b | `ollama pull llama3.2:3b` |
 
 ---
 
@@ -39,8 +39,6 @@ pip install -r requirements.txt
 rag_prototype/data/document.pdf
 ```
 
-If your file has a different name, update `PDF_PATH` in `config.py`.
-
 ### 2. Start Ollama
 
 ```bash
@@ -56,9 +54,10 @@ python ingest.py --pdf data/my_company_brochure.pdf
 ```
 
 This will:
-- Extract all text from the PDF
-- Split it into overlapping token-windows (see `CHUNK_SIZE` / `CHUNK_OVERLAP`)
-- Embed every chunk with `sentence-transformers`
+- Extract text from each PDF via PyMuPDF (better than pypdf for complex layouts)
+- Apply a cleanup pass that fixes common extraction artefacts (e.g. `"99. 9 %"` → `"99.9%"`)
+- Split into overlapping token-windows (see `CHUNK_SIZE` / `CHUNK_OVERLAP` in `config.py`)
+- Embed every chunk with `sentence-transformers` (document embeddings, no prefix)
 - Persist everything in ChromaDB under `./chroma_store/`
 
 ### 4. Query
@@ -72,17 +71,11 @@ python query.py
 ```
 
 For every question you will see:
+- Whether the question was split into sub-queries (compound question handling)
 - **Retrieved chunks** with their cosine distance scores
 - **The full prompt** sent to the LLM
 - **The LLM's answer**
-
-### 5. Inspect embeddings (optional learning tool)
-
-```bash
-python inspect_embeddings.py
-```
-
-Prints the tokenizer output, the embedding vector dimensions, and cosine similarity between example sentences so you can develop intuition for the space.
+- **Timing breakdown**: query embedding / vector search / LLM generation (separately)
 
 ---
 
@@ -91,15 +84,39 @@ Prints the tokenizer output, the embedding vector dimensions, and cosine similar
 | Variable | Default | What changing it does |
 |---|---|---|
 | `EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | Swapping to `bge-base-en-v1.5` gives 768-dim vectors and better retrieval quality at the cost of speed and memory. |
-| `LLM_MODEL` | `llama3.1:8b` | Any model you have pulled with Ollama (e.g. `mistral:7b`, `phi3:mini`). Bigger = slower but smarter answers. |
-| `CHUNK_SIZE` | `256` | Tokens per chunk. Smaller chunks = finer retrieval granularity but less surrounding context. Larger chunks = more context per retrieved piece but scores become noisier. |
-| `CHUNK_OVERLAP` | `32` | Tokens shared between adjacent chunks. Increase if answers feel truncated at chunk boundaries. Set to 0 for hard cuts. |
-| `TOP_K` | `4` | Chunks retrieved per question. Increase for broad questions, decrease to force the LLM to use only the best match. |
-| `CHROMA_DIR` | `./chroma_store` | Where ChromaDB persists data. Change to use a different or shared store. |
-| `PDF_PATH` | `./data/document.pdf` | Default PDF if you don't pass `--pdf` to `ingest.py`. |
-| `COLLECTION_NAME` | `rag_docs` | ChromaDB collection name. Change to maintain separate collections for different documents. |
+| `BGE_QUERY_INSTRUCTION` | `"Represent this sentence for searching relevant passages: "` | Prepended to the query embedding only. bge-small uses this instruction at retrieval time for better accuracy. |
+| `LLM_MODEL` | `llama3.2:3b` | Any model pulled with Ollama. **To use the larger model:** `ollama pull llama3.1:8b` then set `LLM_MODEL = "llama3.1:8b"` in `config.py`. |
+| `LLM_NUM_PREDICT` | `400` | Max tokens generated per answer. Caps latency on verbose responses. |
+| `LLM_KEEP_ALIVE` | `-1` | Seconds to keep the model loaded between queries. `-1` = keep forever (fastest interactive use). |
+| `CHUNK_SIZE` | `350` | Tokens per chunk. Smaller = finer retrieval granularity; larger = more context per chunk. |
+| `CHUNK_OVERLAP` | `60` | Tokens shared between adjacent chunks. Prevents facts from being split across a hard boundary. |
+| `TOP_K` | `8` | Chunks retrieved per question (or per sub-question for compound queries). |
+| `CHROMA_DIR` | `./chroma_store` | Where ChromaDB persists data. |
+| `COLLECTION_NAME` | `rag_docs` | ChromaDB collection name. |
 
-> **After changing `CHUNK_SIZE`, `CHUNK_OVERLAP`, or `EMBED_MODEL`, re-run `ingest.py`** — the existing chunks and embeddings are incompatible with the new settings.
+> **After changing `CHUNK_SIZE`, `CHUNK_OVERLAP`, or `EMBED_MODEL`, re-run `python ingest.py`** — the existing chunks and embeddings are incompatible with the new settings.
+
+---
+
+## GPU acceleration
+
+If an NVIDIA GPU is present, Ollama detects it automatically via CUDA and loads the model onto the GPU. No extra configuration is needed.
+
+- **GPU**: model weights stay in VRAM; typical generation speed 30–60 tok/s on a 3050.
+- **CPU-only**: Ollama falls back to CPU automatically; generation is 3–10× slower.
+
+To verify which device Ollama is using, check the log output of `ollama serve` — it prints the detected backend at startup.
+
+To switch between models:
+
+```bash
+# Fast default (fits in 4 GB VRAM)
+# LLM_MODEL = "llama3.2:3b"   ← already set in config.py
+
+# Higher quality, needs ~6 GB VRAM (or more RAM for CPU)
+ollama pull llama3.1:8b
+# then edit config.py: LLM_MODEL = "llama3.1:8b"
+```
 
 ---
 
@@ -114,13 +131,30 @@ ChromaDB stores **cosine distance** (0 = identical, 2 = opposite).
 
 ---
 
+## Timing breakdown
+
+Every answer prints three timings so you can see where the time goes:
+
+```
+TIMING BREAKDOWN
+  Query embedding :     8.3 ms
+  Vector search   :     2.1 ms
+  LLM generation  :  4832.7 ms  ← bottleneck
+  Total (wall)    :  4843.1 ms  (4.84s)
+```
+
+Retrieval (embed + search) is typically under 50 ms. The LLM is the bottleneck.
+Use `llama3.2:3b` for interactive use; switch to `llama3.1:8b` when answer quality matters more than speed.
+
+---
+
 ## Project layout
 
 ```
 rag_prototype/
 ├── config.py               # all tunables
-├── ingest.py               # PDF → chunks → embeddings → ChromaDB
-├── query.py                # question → retrieve → prompt → Ollama → answer
+├── ingest.py               # PDF → PyMuPDF → cleanup → chunks → embeddings → ChromaDB
+├── query.py                # question → BGE-prefixed embed → retrieve → prompt → Ollama → answer
 ├── inspect_embeddings.py   # tokenizer + embedding teaching tool
 ├── requirements.txt
 ├── README.md
@@ -134,7 +168,7 @@ rag_prototype/
 
 **`Collection not found`** — run `python ingest.py` first.
 
-**`Could not reach Ollama`** — make sure `ollama serve` is running and the model is pulled (`ollama pull llama3.1:8b`).
+**`Could not reach Ollama`** — make sure `ollama serve` is running and the model is pulled (`ollama pull llama3.2:3b`).
 
 **No text extracted from PDF** — the PDF is likely scanned/image-only. You need OCR (e.g. `pytesseract`) before ingesting.
 
