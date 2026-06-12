@@ -51,6 +51,9 @@ ollama serve          # keep this running in a separate terminal
 python ingest.py
 # or specify a path:
 python ingest.py --pdf data/my_company_brochure.pdf
+
+# Override chunking / model without editing config.py:
+python ingest.py --chunk-size 512 --chunk-overlap 50 --embed-model BAAI/bge-small-en-v1.5
 ```
 
 This will:
@@ -68,7 +71,12 @@ python query.py "What products does the company offer?"
 
 # Interactive REPL (Ctrl-C to quit)
 python query.py
+
+# Override retrieval settings at runtime:
+python query.py --top-k 5 --max-context-chunks 3 "What products does the company offer?"
 ```
+
+> **Note:** `--embed-model` in `query.py` must match the model used during ingest — mismatched models produce wrong results.
 
 For every question you will see:
 - Whether the question was split into sub-queries (compound question handling)
@@ -95,6 +103,70 @@ For every question you will see:
 | `COLLECTION_NAME` | `rag_docs` | ChromaDB collection name. |
 
 > **After changing `CHUNK_SIZE`, `CHUNK_OVERLAP`, or `EMBED_MODEL`, re-run `python ingest.py`** — the existing chunks and embeddings are incompatible with the new settings.
+
+---
+
+## Experimentation
+
+### Run the grid-search experiment
+
+Sweeps chunk sizes `[256, 512, 1024]`, overlaps `[0, 50, 100]`, k values `[3, 5, 8]`, and two embedding models — all against the eval questions in `eval/questions.yaml`.
+
+```bash
+pip install pyyaml       # one-time
+python experiment.py
+```
+
+Sample output:
+
+```
+[1/2] Loading model: BAAI/bge-small-en-v1.5 …
+   chunk_size= 256, overlap=  0 → 15 chunks  hit@3=62%  hit@5=75%  hit@8=87%
+   chunk_size= 512, overlap= 50 → 13 chunks  hit@3=87%  hit@5=100% hit@8=100%
+   ...
+
+═══════════════════════════════════════════════════════════════
+ RESULTS TABLE  (8 eval questions — sorted by Hit Rate ↓)
+═══════════════════════════════════════════════════════════════
+   # │ Model                  │ ChkSz │ Ovlp │  K │ Chunks │  Top-1 Sim │   Hit Rate
+ ───┼────────────────────────┼───────┼──────┼────┼────────┼────────────┼───────────
+   1 │ bge-small-en-v1.5      │   512 │   50 │  3 │     13 │     0.7432 │   100.0%  ★
+ ...
+```
+
+Narrow the sweep:
+
+```bash
+python experiment.py --models BAAI/bge-small-en-v1.5  --chunk-sizes 256 512
+python experiment.py --questions eval/questions.yaml   # custom eval file
+```
+
+### Edit the eval set
+
+`eval/questions.yaml` contains 8 factual questions about the NovaSpark PDFs. Each entry pairs a question with a keyword that must appear (case-insensitive) in at least one of the top-k chunks for a "hit":
+
+```yaml
+questions:
+  - question: "How many employees does NovaSpark have?"
+    keyword: "280"
+```
+
+Add your own questions to measure coverage on facts that matter to you.
+
+---
+
+## Streamlit app (optional)
+
+Install Streamlit and launch the live UI:
+
+```bash
+pip install streamlit
+streamlit run app.py
+```
+
+The app lets you drag sliders for chunk size, overlap, and k and immediately see the re-indexed results and a fresh LLM answer — no command line needed.
+
+The CLI (`ingest.py`, `query.py`) works without Streamlit installed.
 
 ---
 
@@ -154,11 +226,17 @@ Use `llama3.2:3b` for interactive use; switch to `llama3.1:8b` when answer quali
 rag_prototype/
 ├── config.py               # all tunables
 ├── ingest.py               # PDF → PyMuPDF → cleanup → chunks → embeddings → ChromaDB
-├── query.py                # question → BGE-prefixed embed → retrieve → prompt → Ollama → answer
+│                           #   CLI: --chunk-size  --chunk-overlap  --embed-model
+├── query.py                # question → embed → retrieve → prompt → Ollama → answer
+│                           #   CLI: --top-k  --max-context-chunks  --embed-model
+├── experiment.py           # grid search: chunk sizes × overlaps × k × models → hit-rate table
+├── app.py                  # Streamlit UI (optional; pip install streamlit)
+├── eval/
+│   └── questions.yaml      # 8 eval questions with expected keywords
 ├── inspect_embeddings.py   # tokenizer + embedding teaching tool
 ├── requirements.txt
 ├── README.md
-├── data/                   # drop your PDF here
+├── data/                   # drop your PDFs here
 └── chroma_store/           # auto-created by ingest.py
 ```
 

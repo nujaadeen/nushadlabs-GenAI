@@ -1,0 +1,29 @@
+# NovaSpark RAG evaluation set
+# Each entry: question (str) + keyword (str, case-insensitive substring match
+# against the text of any chunk in the top-k results).
+# Keep keywords unambiguous and present verbatim in the PDFs.
+
+questions:
+  - question: "How many employees does NovaSpark have?"
+    keyword: "280"
+
+  - question: "When was NovaSpark founded?"
+    keyword: "2017"
+
+  - question: "What is the monthly price for the Professional SparkStream tier?"
+    keyword: "1,999"
+
+  - question: "What uptime SLA does the Starter plan guarantee?"
+    keyword: "99.9%"
+
+  - question: "What is the overage rate per million events in SparkStream?"
+    keyword: "0.12"
+
+  - question: "What compliance certifications does NovaSpark hold?"
+    keyword: "SOC 2"
+
+  - question: "Where is NovaSpark headquartered?"
+    keyword: "Austin"
+
+  - question: "How many customers does NovaSpark serve?"
+    keyword: "1,400"

@@ -124,17 +124,17 @@ def _sample_before_after(raw: str, cleaned: str, n_chars: int = 600) -> None:
 _MAX_EMBED_TOKENS = 510
 
 
-def enforce_max_tokens(chunks: list[str], tokenizer) -> list[str]:
-    """Hard-split any chunk that exceeds _MAX_EMBED_TOKENS before embedding."""
+def enforce_max_tokens(chunks: list[str], tokenizer, max_tokens: int = _MAX_EMBED_TOKENS) -> list[str]:
+    """Hard-split any chunk that exceeds max_tokens before embedding."""
     result: list[str] = []
     for chunk in chunks:
         ids = tokenizer.encode(chunk, add_special_tokens=False)
-        if len(ids) <= _MAX_EMBED_TOKENS:
+        if len(ids) <= max_tokens:
             result.append(chunk)
         else:
-            for start in range(0, len(ids), _MAX_EMBED_TOKENS):
+            for start in range(0, len(ids), max_tokens):
                 sub = tokenizer.decode(
-                    ids[start:start + _MAX_EMBED_TOKENS], skip_special_tokens=True
+                    ids[start:start + max_tokens], skip_special_tokens=True
                 ).strip()
                 if sub:
                     result.append(sub)
@@ -248,9 +248,27 @@ def ingest(pdf_paths: list[str]) -> None:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Ingest PDFs into ChromaDB")
-    parser.add_argument("--pdf", default=None, help="Ingest a single PDF instead of the whole data folder")
+    parser = argparse.ArgumentParser(
+        description="Ingest PDFs into ChromaDB",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--pdf", default=None, metavar="PATH",
+                        help="Ingest a single PDF instead of the whole data folder")
+    parser.add_argument("--chunk-size", type=int, default=None, metavar="N",
+                        help=f"Tokens per chunk (config default: {config.CHUNK_SIZE})")
+    parser.add_argument("--chunk-overlap", type=int, default=None, metavar="N",
+                        help=f"Overlap between consecutive chunks (config default: {config.CHUNK_OVERLAP})")
+    parser.add_argument("--embed-model", default=None, metavar="MODEL",
+                        help=f"Sentence-transformers model ID (config default: {config.EMBED_MODEL})")
     args = parser.parse_args()
+
+    # Apply CLI overrides in-process (does NOT edit config.py)
+    if args.chunk_size is not None:
+        config.CHUNK_SIZE = args.chunk_size
+    if args.chunk_overlap is not None:
+        config.CHUNK_OVERLAP = args.chunk_overlap
+    if args.embed_model is not None:
+        config.EMBED_MODEL = args.embed_model
 
     if args.pdf:
         if not Path(args.pdf).exists():

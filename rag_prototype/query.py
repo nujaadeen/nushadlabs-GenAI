@@ -121,9 +121,9 @@ def retrieve(
     if n_results is None:
         n_results = config.TOP_K
 
-    # BGE-small retrieves better when the QUERY is prefixed with this instruction.
-    # Document embeddings stored in ChromaDB do NOT use this prefix.
-    instructed_query = config.BGE_QUERY_INSTRUCTION + question
+    # BGE models require a query instruction prefix; other models do not.
+    prefix = config.BGE_QUERY_INSTRUCTION if "bge" in config.EMBED_MODEL.lower() else ""
+    instructed_query = prefix + question
 
     t0 = time.perf_counter()
     q_embedding = model.encode([instructed_query], normalize_embeddings=True)
@@ -317,9 +317,26 @@ def answer_question(question: str, model: SentenceTransformer, collection) -> No
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Query the local RAG system")
+    parser = argparse.ArgumentParser(
+        description="Query the local RAG system",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument("question", nargs="?", default=None, help="Question to ask")
+    parser.add_argument("--top-k", type=int, default=None, metavar="N",
+                        help=f"Chunks to retrieve (config default: {config.TOP_K})")
+    parser.add_argument("--max-context-chunks", type=int, default=None, metavar="N",
+                        help=f"Chunks sent to LLM (config default: {config.MAX_CONTEXT_CHUNKS})")
+    parser.add_argument("--embed-model", default=None, metavar="MODEL",
+                        help=f"Embedding model — must match what was used in ingest (config default: {config.EMBED_MODEL})")
     args = parser.parse_args()
+
+    # Apply CLI overrides in-process (does NOT edit config.py)
+    if args.top_k is not None:
+        config.TOP_K = args.top_k
+    if args.max_context_chunks is not None:
+        config.MAX_CONTEXT_CHUNKS = args.max_context_chunks
+    if args.embed_model is not None:
+        config.EMBED_MODEL = args.embed_model
 
     # Load model (kept warm; not reloaded between questions in interactive mode)
     print(f"[query] Loading embedding model '{config.EMBED_MODEL}' …")
