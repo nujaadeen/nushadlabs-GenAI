@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: erp_db
+      POSTGRES_USER: erp_user
+      POSTGRES_PASSWORD: erp_pass
+    ports:
+      # Mapped to 5433 on the host to avoid clashing with a local Postgres on 5432.
+      # Change to "5432:5432" if port 5432 is free, and update DATABASE_URL accordingly.
+      - "5433:5432"
+    volumes:
+      - ./seed.sql:/docker-entrypoint-initdb.d/seed.sql
+      - erp_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U erp_user -d erp_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  erp_pgdata:
