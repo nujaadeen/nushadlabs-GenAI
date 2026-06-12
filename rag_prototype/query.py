@@ -9,6 +9,7 @@ Usage:
 import argparse
 import json
 import re
+import subprocess
 import sys
 import textwrap
 import time
@@ -25,6 +26,43 @@ _WRAP = 100
 
 def _hr(char="─", width=_WRAP):
     print(char * width)
+
+
+# ---------------------------------------------------------------------------
+# Ollama device detection
+# ---------------------------------------------------------------------------
+
+def get_ollama_device() -> str:
+    """Return a one-line string describing whether Ollama is using GPU or CPU."""
+    # Primary: Ollama /api/ps JSON endpoint (available since Ollama 0.1.33)
+    try:
+        url = f"{config.OLLAMA_BASE_URL}/api/ps"
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+            model_base = config.LLM_MODEL.split(":")[0]
+            for m in data.get("models", []):
+                if model_base in m.get("name", ""):
+                    size_vram = m.get("size_vram", 0)
+                    if size_vram and size_vram > 0:
+                        return f"GPU ({size_vram / 1e9:.1f} GB VRAM)"
+                    return "CPU (0 VRAM allocated)"
+            return "CPU/GPU unknown (model not yet loaded — will show after first query)"
+    except Exception:
+        pass
+
+    # Fallback: parse `ollama ps` CLI output
+    try:
+        result = subprocess.run(
+            ["ollama", "ps"], capture_output=True, text=True, timeout=5
+        )
+        model_base = config.LLM_MODEL.split(":")[0]
+        for line in result.stdout.splitlines()[1:]:
+            if model_base in line:
+                return "GPU" if "GPU" in line else "CPU"
+        return "CPU/GPU unknown (model not yet loaded — will show after first query)"
+    except Exception as exc:
+        return f"unknown (could not query Ollama: {exc})"
 
 
 # ---------------------------------------------------------------------------
@@ -70,11 +108,19 @@ def split_compound_question(question: str) -> list[str]:
 # ChromaDB retrieval
 # ---------------------------------------------------------------------------
 
-def retrieve(question: str, model: SentenceTransformer, collection) -> tuple[list[str], list[float], list[dict], float, float]:
+def retrieve(
+    question: str,
+    model: SentenceTransformer,
+    collection,
+    n_results: int | None = None,
+) -> tuple[list[str], list[float], list[dict], float, float]:
     """
     Embed `question` (with BGE query instruction prefix), query ChromaDB for
-    top-k results.  Returns (chunks, distances, metadatas, embed_ms, search_ms).
+    n_results (defaults to TOP_K).  Returns (chunks, distances, metadatas, embed_ms, search_ms).
     """
+    if n_results is None:
+        n_results = config.TOP_K
+
     # BGE-small retrieves better when the QUERY is prefixed with this instruction.
     # Document embeddings stored in ChromaDB do NOT use this prefix.
     instructed_query = config.BGE_QUERY_INSTRUCTION + question
@@ -86,7 +132,7 @@ def retrieve(question: str, model: SentenceTransformer, collection) -> tuple[lis
     t1 = time.perf_counter()
     results = collection.query(
         query_embeddings=q_embedding.tolist(),
-        n_results=config.TOP_K,
+        n_results=n_results,
         include=["documents", "distances", "metadatas"],
     )
     search_ms = (time.perf_counter() - t1) * 1000
@@ -99,7 +145,7 @@ def retrieve(question: str, model: SentenceTransformer, collection) -> tuple[lis
 
 def retrieve_multi(sub_questions: list[str], model: SentenceTransformer, collection) -> tuple[list[str], list[float], list[dict], float, float]:
     """
-    Retrieve chunks for each sub-question, merge, and de-duplicate by chunk ID.
+    Retrieve top-3 chunks per sub-question, merge, and de-duplicate by chunk text.
     Returns the same shape as retrieve().
     """
     seen_docs: dict[str, tuple[float, dict]] = {}  # doc_text → (best_distance, meta)
@@ -107,7 +153,9 @@ def retrieve_multi(sub_questions: list[str], model: SentenceTransformer, collect
     total_search_ms = 0.0
 
     for sub_q in sub_questions:
-        chunks, distances, metadatas, embed_ms, search_ms = retrieve(sub_q, model, collection)
+        chunks, distances, metadatas, embed_ms, search_ms = retrieve(
+            sub_q, model, collection, n_results=config.COMPOUND_K
+        )
         total_embed_ms += embed_ms
         total_search_ms += search_ms
         for chunk, dist, meta in zip(chunks, distances, metadatas):
@@ -128,7 +176,14 @@ def retrieve_multi(sub_questions: list[str], model: SentenceTransformer, collect
 
 SYSTEM_PROMPT = (
     "You are a knowledgeable assistant for NovaSpark Technologies. "
-    "Answer the user's question using ONLY the context provided below.\n"
+    "Answer the user's question using ONLY the context provided below. "
+    "Keep your answer concise.\n\n"
+    "CITATION RULE: For every factual claim that involves a specific number, name, or date, "
+    "you MUST quote the exact sentence from the context that supports it, in the form: "
+    "Answer ... (source: \"<exact quoted sentence from context>\"). "
+    "If no sentence in the context states the fact, say exactly: "
+    "\"I cannot find that information in the provided context.\" "
+    "Do NOT infer, estimate, or guess numbers — only report what the context explicitly states.\n\n"
     "When the user describes a business need or data challenge, explicitly recommend "
     "the most relevant NovaSpark product from the context and explain WHY it fits — "
     "do not hedge with 'it depends' when the context makes a clear recommendation possible.\n"
@@ -209,10 +264,20 @@ def answer_question(question: str, model: SentenceTransformer, collection) -> No
     else:
         chunks, distances, metadatas, embed_ms, search_ms = retrieve(question, model, collection)
 
+    retrieved_count = len(chunks)
+
+    # Cap the context sent to the LLM (biggest single latency and grounding win).
+    chunks    = chunks[:config.MAX_CONTEXT_CHUNKS]
+    distances = distances[:config.MAX_CONTEXT_CHUNKS]
+    metadatas = metadatas[:config.MAX_CONTEXT_CHUNKS]
+    print(f"[query] Context: retrieved {retrieved_count} chunks → "
+          f"sending {len(chunks)} to LLM (MAX_CONTEXT_CHUNKS={config.MAX_CONTEXT_CHUNKS})")
+
     print(f"\n{'─'*_WRAP}")
     print(f"RETRIEVED CHUNKS  (cosine distance — LOWER is more similar; 0.0 = identical)")
     if is_compound:
-        print(f"[merged results from {len(sub_questions)} sub-queries, de-duplicated]")
+        print(f"[{len(sub_questions)} sub-queries × {config.COMPOUND_K} each → "
+              f"{retrieved_count} unique after dedup → {len(chunks)} sent to LLM]")
     print(f"{'─'*_WRAP}")
     for i, (chunk, dist, meta) in enumerate(zip(chunks, distances, metadatas)):
         similarity = 1.0 - dist
@@ -259,6 +324,10 @@ def main() -> None:
     # Load model (kept warm; not reloaded between questions in interactive mode)
     print(f"[query] Loading embedding model '{config.EMBED_MODEL}' …")
     model = SentenceTransformer(config.EMBED_MODEL)
+
+    # Report Ollama hardware before the first query
+    device = get_ollama_device()
+    print(f"[query] Ollama serving '{config.LLM_MODEL}' on: {device}")
 
     # Connect to ChromaDB
     client = chromadb.PersistentClient(path=config.CHROMA_DIR)
