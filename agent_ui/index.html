@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RAG Agent UI</title>
+  <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+
+  <!-- ── Header ─────────────────────────────────────────────────────────── -->
+  <header class="app-header">
+    <div class="header-left">
+      <h1>RAG Agent <span class="badge">local</span></h1>
+
+      <!-- Health indicator — updated by main.js on load -->
+      <div id="health" class="health" role="status" aria-live="polite">
+        <span class="dot"></span>
+        <span id="health-text">checking…</span>
+      </div>
+    </div>
+
+    <div class="header-right">
+      <!-- Bearer token sent with every /chat request -->
+      <label for="token-input" class="sr-only">Bearer token</label>
+      <input
+        id="token-input"
+        type="text"
+        value="demo-token-tenant-1"
+        placeholder="Bearer token"
+        title="Authorization: Bearer <token>"
+        spellcheck="false"
+      />
+    </div>
+  </header>
+
+  <!-- ── Main layout: left column + right log column ────────────────────── -->
+  <main class="layout">
+
+    <!-- Left column: controls + answer + tool calls -->
+    <section class="col-main">
+
+      <!-- Input row -->
+      <div class="input-row">
+        <textarea
+          id="msg-input"
+          rows="2"
+          placeholder="Ask something… (Enter to send, Shift+Enter for newline)"
+          aria-label="Message"
+          spellcheck="true"
+        ></textarea>
+        <div class="btn-col">
+          <button id="send-btn" class="btn-primary">Send</button>
+          <button id="new-session-btn" class="btn-secondary" title="Clear everything and start a new session">New session</button>
+        </div>
+      </div>
+
+      <!-- Stats + session id (updated after each request) -->
+      <div class="meta-row">
+        <span id="stats" aria-live="polite"></span>
+        <span id="session-display" class="session-id" aria-live="polite"></span>
+      </div>
+
+      <!-- Answer pane -->
+      <div class="pane answer-pane" id="answer-pane">
+        <div class="pane-header">Answer</div>
+        <!-- Token content streams here; a blinking caret appears while streaming -->
+        <div id="answer-body" class="answer-body" aria-live="polite"></div>
+        <!-- Intent / tools / sources shown on "done" -->
+        <div id="answer-footer" class="answer-footer"></div>
+      </div>
+
+      <!-- Tool calls pane -->
+      <div class="pane tool-pane">
+        <div class="pane-header">
+          Tool calls
+          <span id="tool-count" class="badge-count" aria-label="tool call count"></span>
+        </div>
+        <div id="tool-list" class="tool-list"></div>
+      </div>
+
+    </section>
+
+    <!-- Right column: raw SSE log -->
+    <section class="col-log">
+      <div class="pane log-pane">
+        <div class="pane-header">
+          Raw SSE log
+          <button id="clear-log-btn" class="btn-clear">clear</button>
+        </div>
+        <div id="log-list" class="log-list" aria-label="SSE event log"></div>
+      </div>
+    </section>
+
+  </main>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>

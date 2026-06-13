@@ -1,0 +1,14 @@
+{
+  "name": "agent-ui",
+  "version": "1.0.0",
+  "description": "Local testing UI for the RAG agent API",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "vite": "^5.2.0"
+  }
+}
