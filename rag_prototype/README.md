@@ -100,7 +100,8 @@ For every question you will see:
 | `CHUNK_OVERLAP` | `60` | Tokens shared between adjacent chunks. Prevents facts from being split across a hard boundary. |
 | `TOP_K` | `8` | Chunks retrieved per question (or per sub-question for compound queries). |
 | `CHROMA_DIR` | `./chroma_store` | Where ChromaDB persists data. |
-| `COLLECTION_NAME` | `rag_docs` | ChromaDB collection name. |
+| `COLLECTION_DOC` | `rag_docs` | ChromaDB collection name for docs. |
+| `COLLECTION_PRODUCT` | `rag_product` | ChromaDB collection name for DB products. |
 
 > **After changing `CHUNK_SIZE`, `CHUNK_OVERLAP`, or `EMBED_MODEL`, re-run `python ingest.py`** — the existing chunks and embeddings are incompatible with the new settings.
 
@@ -220,6 +221,123 @@ Use `llama3.2:3b` for interactive use; switch to `llama3.1:8b` when answer quali
 
 ---
 
+---
+
+## FastAPI service (`api.py`)
+
+### Start the server
+
+```bash
+pip install fastapi "uvicorn[standard]"
+uvicorn api:app --host 0.0.0.0 --port 8000 --reload
+```
+
+### Auth model
+
+Every `/chat` request **must** carry an `Authorization: Bearer <token>` header.
+The token is resolved server-side to a `tenant_id` — the body never controls
+which tenant's data is searched.
+
+| Token | Tenant |
+|---|---|
+| `demo-token-tenant-1` | 1 — NovaSpark Technologies |
+| `demo-token-tenant-2` | 2 — FreshMart Grocery Co. |
+| `demo-token-tenant-3` | 3 — Grain & Glory Artisan Bakery |
+| `admin-demo-secret`   | Admin (ingest only) |
+
+Override any token at startup via env vars:
+```bash
+TENANT_1_TOKEN=my-real-secret ADMIN_TOKEN=prod-admin-key uvicorn api:app ...
+```
+
+### `GET /health`
+
+```bash
+curl http://localhost:8000/health
+# {"status":"ok","embed_model":"BAAI/bge-small-en-v1.5","llm_model":"llama3.2:3b","ollama_url":"http://localhost:11434"}
+```
+
+### `POST /chat` — streamed SSE response
+
+The response is a stream of Server-Sent Events.  Each event is a JSON line:
+
+```
+data: {"type":"token","content":"The "}
+data: {"type":"token","content":"newest "}
+...
+data: {"type":"done","intent":"analytics_newest","sources":[{"type":"sql","table":"products","rows":5}],"session_id":"<uuid>"}
+```
+
+**Doc / policy question (tenant 1)**
+```bash
+curl -N -X POST http://localhost:8000/chat \
+  -H "Authorization: Bearer demo-token-tenant-1" \
+  -H "Content-Type: application/json" \
+  -d '{"message": "What are NovaSpark data privacy terms?", "session_id": "sess-001"}'
+```
+
+**Analytics question — newest products (tenant 2)**
+```bash
+curl -N -X POST http://localhost:8000/chat \
+  -H "Authorization: Bearer demo-token-tenant-2" \
+  -H "Content-Type: application/json" \
+  -d '{"message": "What are the newest products in the store?", "session_id": "sess-002"}'
+```
+
+**Product / page-context question (tenant 2)**
+```bash
+curl -N -X POST http://localhost:8000/chat \
+  -H "Authorization: Bearer demo-token-tenant-2" \
+  -H "Content-Type: application/json" \
+  -d '{"message": "Can you recommend a product for a family picnic?", "session_id": "sess-002"}'
+```
+
+**Multi-turn: follow-up in same session**
+```bash
+curl -N -X POST http://localhost:8000/chat \
+  -H "Authorization: Bearer demo-token-tenant-2" \
+  -H "Content-Type: application/json" \
+  -d '{"message": "What about something with a discount?", "session_id": "sess-002"}'
+```
+
+**Tenant isolation demo — token A cannot reach tenant B data**
+```bash
+# This request uses tenant-1 token but asks about FreshMart (tenant 2).
+# ChromaDB hard-filters WHERE tenant_id=1, so only tenant-1 docs are searched.
+curl -N -X POST http://localhost:8000/chat \
+  -H "Authorization: Bearer demo-token-tenant-1" \
+  -H "Content-Type: application/json" \
+  -d '{"message": "Show me FreshMart loyalty rewards", "session_id": "cross-check"}'
+```
+
+### `POST /ingest` — admin only
+
+```bash
+# Ingest a single PDF for tenant 1
+curl -X POST http://localhost:8000/ingest \
+  -H "Authorization: Bearer admin-demo-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"tenant_id": 1, "pdf_path": "data/company_brochure.pdf"}'
+
+# Ingest all PDFs in data/ for tenant 2
+curl -X POST http://localhost:8000/ingest \
+  -H "Authorization: Bearer admin-demo-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"tenant_id": 2}'
+```
+
+### Streaming response format
+
+| `type` field | When | Fields |
+|---|---|---|
+| `token` | Each Ollama output token | `content` |
+| `done`  | End of stream | `intent`, `sources`, `session_id` |
+| `error` | Unexpected failure | `message` |
+
+`intent` values: `doc_rag` · `product_rag` · `analytics_newest` · `analytics_discount` · `analytics_demand`
+
+---
+
 ## Project layout
 
 ```
@@ -229,8 +347,12 @@ rag_prototype/
 │                           #   CLI: --chunk-size  --chunk-overlap  --embed-model
 ├── query.py                # question → embed → retrieve → prompt → Ollama → answer
 │                           #   CLI: --top-k  --max-context-chunks  --embed-model
+├── router.py               # intent classifier → analytics SQL or RAG → answer
+├── api.py                  # FastAPI service: /chat (SSE stream), /health, /ingest
 ├── experiment.py           # grid search: chunk sizes × overlaps × k × models → hit-rate table
 ├── app.py                  # Streamlit UI (optional; pip install streamlit)
+├── tools/
+│   └── analytics.py        # SQL analytics functions (newest, discount, demand)
 ├── eval/
 │   └── questions.yaml      # 8 eval questions with expected keywords
 ├── inspect_embeddings.py   # tokenizer + embedding teaching tool

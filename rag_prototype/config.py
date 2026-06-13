@@ -60,8 +60,16 @@ CHROMA_DIR = "./chroma_store"
 # Folder scanned for PDFs by ingest.py (all *.pdf files inside are ingested).
 DATA_DIR = "./data"
 
-# ChromaDB collection name – change if you want separate collections per doc.
-COLLECTION_NAME = "rag_docs"
+# ChromaDB collection name for documents.
+COLLECTION_DOCS = "rag_docs"
+
+# ChromaDB collection name for products.
+COLLECTION_PRODUCTS = "rag_products"
+
+# --- Analytics formatting ---
+# When True, ask the LLM for a one-line intro before the Python-formatted list.
+# When False (default), skip the LLM entirely — SQL + Python format only (<1 s).
+ANALYTICS_LLM_INTRO = False
 
 # --- Tenant registry ---
 # Maps integer tenant IDs to display metadata used in system prompts.

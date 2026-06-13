@@ -13,7 +13,9 @@ import subprocess
 import sys
 import textwrap
 import time
+import urllib.error
 import urllib.request
+from collections.abc import Iterator
 
 import chromadb
 from sentence_transformers import SentenceTransformer
@@ -261,6 +263,41 @@ def ask_ollama(prompt: str) -> tuple[str, float]:
         return msg, llm_ms
 
 
+def ask_ollama_stream(prompt: str) -> Iterator[str]:
+    """Stream tokens from Ollama's /api/generate endpoint one by one."""
+    url = f"{config.OLLAMA_BASE_URL}/api/generate"
+    payload = json.dumps({
+        "model": config.LLM_MODEL,
+        "prompt": prompt,
+        "stream": True,
+        "options": {"num_predict": config.LLM_NUM_PREDICT},
+        "keep_alive": config.LLM_KEEP_ALIVE,
+    }).encode()
+
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            for raw_line in resp:
+                if not raw_line:
+                    continue
+                try:
+                    data = json.loads(raw_line.decode())
+                except json.JSONDecodeError:
+                    continue
+                token = data.get("response", "")
+                if token:
+                    yield token
+                if data.get("done"):
+                    break
+    except urllib.error.URLError as e:
+        yield f"[ERROR] Could not reach Ollama at {config.OLLAMA_BASE_URL}: {e}"
+
+
 # ---------------------------------------------------------------------------
 # Single question handler
 # ---------------------------------------------------------------------------
@@ -379,11 +416,11 @@ def main() -> None:
     # Connect to ChromaDB
     client = chromadb.PersistentClient(path=config.CHROMA_DIR)
     try:
-        collection = client.get_collection(config.COLLECTION_NAME)
-        print(f"[query] Connected to collection '{config.COLLECTION_NAME}' "
+        collection = client.get_collection(config.COLLECTION_DOCS)
+        print(f"[query] Connected to collection '{config.COLLECTION_DOCS}' "
               f"({collection.count()} chunks).\n")
     except Exception:
-        print(f"[query] ERROR: Collection '{config.COLLECTION_NAME}' not found.")
+        print(f"[query] ERROR: Collection '{config.COLLECTION_DOCS}' not found.")
         print(f"         Run `python ingest.py --tenant-id TENANT_ID` first.")
         sys.exit(1)
 

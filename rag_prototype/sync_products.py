@@ -37,7 +37,6 @@ from db import Product, get_session_factory
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-PRODUCTS_COLLECTION = "products"
 SYNC_STATE_PATH = Path(__file__).with_name("product_sync_state.json")
 
 # Epoch used as the "never synced before" watermark
@@ -159,7 +158,7 @@ def sync_all(tenant_ids: list[int], full: bool = False) -> None:
 
     chroma_client = chromadb.PersistentClient(path=config.CHROMA_DIR)
     collection = chroma_client.get_or_create_collection(
-        name=PRODUCTS_COLLECTION,
+        name=config.COLLECTION_PRODUCTS,
         metadata={"hnsw:space": "cosine"},
     )
 
@@ -172,7 +171,7 @@ def sync_all(tenant_ids: list[int], full: bool = False) -> None:
 
     _save_state(state)
     print(f"\n[sync] Done.  {total} product(s) upserted into "
-          f"collection '{PRODUCTS_COLLECTION}'  "
+          f"collection '{config.COLLECTION_PRODUCTS}'  "
           f"(total vectors: {collection.count()})")
 
 
@@ -187,9 +186,9 @@ def search_products(query: str, tenant_id: int, n_results: int = 5) -> None:
 
     chroma_client = chromadb.PersistentClient(path=config.CHROMA_DIR)
     try:
-        collection = chroma_client.get_collection(PRODUCTS_COLLECTION)
+        collection = chroma_client.get_collection(config.COLLECTION_PRODUCTS)
     except Exception:
-        print(f"[search] ERROR: collection '{PRODUCTS_COLLECTION}' not found. "
+        print(f"[search] ERROR: collection '{config.COLLECTION_PRODUCTS}' not found. "
               "Run sync_products.py first.")
         sys.exit(1)
 

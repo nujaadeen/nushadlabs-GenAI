@@ -21,13 +21,15 @@ Entry point:
 import json
 import logging
 import re
+import time
 import urllib.request
+from collections.abc import Iterator
 
 import chromadb
 from sentence_transformers import SentenceTransformer
 
 import config
-from query import ask_ollama, retrieve
+from query import ask_ollama, ask_ollama_stream, retrieve
 from tools.analytics import (
     highest_demand_products,
     highest_discount_products,
@@ -176,46 +178,73 @@ def _no_answer_msg(tenant_id: int) -> str:
     )
 
 
-# ── Analytics answer synthesis ────────────────────────────────────────────────
+# ── Analytics formatting (Python-only, no LLM) ───────────────────────────────
 
-_ANALYTICS_SYSTEM = (
-    "You are a helpful assistant. Answer the user's question using ONLY the "
-    "structured data provided below. Be concise and factual. Do not invent "
-    "information that is not in the data."
-)
-
-_ANALYTICS_PROMPT = (
-    "{system}\n\n"
-    "=== DATA ===\n{data}\n\n"
-    "=== QUESTION ===\n{question}\n\n"
-    "=== ANSWER ==="
-)
+_ANALYTICS_HEADERS = {
+    "analytics_newest":   "Here are the {n} newest products:",
+    "analytics_discount": "Here are the {n} most discounted products:",
+    "analytics_demand":   "Here are the {n} most popular products:",
+}
 
 
-def _format_rows(rows: list[dict]) -> str:
-    lines = []
+def _format_analytics_answer(intent: str, rows: list[dict]) -> str:
+    """Build a clean numbered list directly from SQL rows — zero LLM involvement."""
+    header = _ANALYTICS_HEADERS.get(intent, "Here are {n} products:").format(n=len(rows))
+    lines = [header]
     for i, p in enumerate(rows, 1):
-        disc = f"  {p['discount_pct']:.0f}% off" if p["discount_pct"] else ""
+        date = p["created_at"][:10] if p["created_at"] else "unknown"
+        disc = f", {p['discount_pct']:.0f}% off" if p["discount_pct"] else ""
         lines.append(
-            f"{i}. {p['name']}"
-            f"  |  ${p['price']:.2f}{disc}"
-            f"  |  demand={p['demand_score']}"
-            f"  |  stock={p['stock']}"
-            f"  |  added={p['created_at'][:10] if p['created_at'] else 'unknown'}"
+            f"{i}. {p['name']} — ${p['price']:.2f}{disc},"
+            f" added {date}, {p['stock']} in stock"
         )
     return "\n".join(lines)
 
 
-def _analytics_answer(question: str, rows: list[dict], tenant_id: int) -> str:
+# ── Optional one-line LLM intro (ANALYTICS_LLM_INTRO=True only) ─────────────
+
+_ANALYTICS_INTRO_PROMPT = (
+    "Write ONE short sentence introducing a product list to the user. "
+    "Do not list or describe the products yourself.\n"
+    "Question: {question}\n"
+    "Number of results: {count}\n"
+    "Intro:"
+)
+
+
+def _analytics_intro_sentence(question: str, count: int) -> str:
+    """Return a single LLM-generated intro sentence, or '' on failure."""
+    url = f"{config.OLLAMA_BASE_URL}/api/generate"
+    payload = json.dumps({
+        "model": config.LLM_MODEL,
+        "prompt": _ANALYTICS_INTRO_PROMPT.format(question=question, count=count),
+        "stream": False,
+        "options": {"num_predict": 50},
+        "keep_alive": config.LLM_KEEP_ALIVE,
+    }).encode()
+    req = urllib.request.Request(
+        url, data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode()).get("response", "").strip()
+    except Exception as exc:
+        logger.warning("[analytics] LLM intro failed: %s", exc)
+        return ""
+
+
+# ── Non-streaming analytics (used by ask()) ───────────────────────────────────
+
+def _analytics_answer(question: str, rows: list[dict], intent: str, tenant_id: int) -> str:
     if not rows:
         return _no_answer_msg(tenant_id)
-    prompt = _ANALYTICS_PROMPT.format(
-        system=_ANALYTICS_SYSTEM,
-        data=_format_rows(rows),
-        question=question,
-    )
-    answer, _ = ask_ollama(prompt)
-    return answer
+    formatted = _format_analytics_answer(intent, rows)
+    if config.ANALYTICS_LLM_INTRO:
+        intro = _analytics_intro_sentence(question, len(rows))
+        return f"{intro}\n\n{formatted}" if intro else formatted
+    return formatted
 
 
 # ── RAG system prompt (router variant) ───────────────────────────────────────
@@ -242,12 +271,28 @@ def _rag_system_prompt(tenant_id: int) -> str:
     )
 
 
-def _build_rag_prompt(question: str, chunks: list[str], tenant_id: int) -> str:
+def _history_block(history: list[dict] | None) -> str:
+    if not history:
+        return ""
+    recent = history[-4:]  # last 2 user+assistant pairs
+    lines = ["=== CONVERSATION HISTORY ==="]
+    for turn in recent:
+        lines.append(f"{turn['role'].capitalize()}: {turn['content']}")
+    return "\n".join(lines) + "\n\n"
+
+
+def _build_rag_prompt(
+    question: str,
+    chunks: list[str],
+    tenant_id: int,
+    history: list[dict] | None = None,
+) -> str:
     context_block = "\n\n---\n\n".join(
         f"[Chunk {i+1}]\n{chunk}" for i, chunk in enumerate(chunks)
     )
     return (
         f"{_rag_system_prompt(tenant_id)}\n\n"
+        f"{_history_block(history)}"
         f"=== CONTEXT ===\n{context_block}\n\n"
         f"=== QUESTION ===\n{question}\n\n"
         f"=== ANSWER ==="
@@ -290,17 +335,17 @@ def ask(question: str, tenant_id: int, limit: int = 5) -> str:
     if intent == "analytics_newest":
         rows = newest_products(tenant_id, limit)
         print(f"[router] SQL returned {len(rows)} row(s)")
-        return _analytics_answer(question, rows, tenant_id)
+        return _analytics_answer(question, rows, intent, tenant_id)
 
     if intent == "analytics_discount":
         rows = highest_discount_products(tenant_id, limit)
         print(f"[router] SQL returned {len(rows)} row(s)")
-        return _analytics_answer(question, rows, tenant_id)
+        return _analytics_answer(question, rows, intent, tenant_id)
 
     if intent == "analytics_demand":
         rows = highest_demand_products(tenant_id, limit)
         print(f"[router] SQL returned {len(rows)} row(s)")
-        return _analytics_answer(question, rows, tenant_id)
+        return _analytics_answer(question, rows, intent, tenant_id)
 
     # ── RAG paths (embeddings + ChromaDB) ────────────────────────────────────
     model = SentenceTransformer(config.EMBED_MODEL)
@@ -308,7 +353,7 @@ def ask(question: str, tenant_id: int, limit: int = 5) -> str:
 
     if intent == "product_rag":
         try:
-            collection = chroma.get_collection("products")
+            collection = chroma.get_collection(config.COLLECTION_PRODUCTS)
         except Exception:
             return _no_answer_msg(tenant_id)
         print("[router] path=product_rag  (ChromaDB products collection)")
@@ -316,11 +361,107 @@ def ask(question: str, tenant_id: int, limit: int = 5) -> str:
 
     # doc_rag (default)
     try:
-        collection = chroma.get_collection(config.COLLECTION_NAME)
+        collection = chroma.get_collection(config.COLLECTION_DOCS)
     except Exception:
         return _no_answer_msg(tenant_id)
-    print(f"[router] path=doc_rag  (ChromaDB {config.COLLECTION_NAME} collection)")
+    print(f"[router] path=doc_rag  (ChromaDB {config.COLLECTION_DOCS} collection)")
     return _rag_answer(question, tenant_id, model, collection)
+
+
+# ── Streaming entry point (used by api.py) ────────────────────────────────────
+
+
+def ask_stream(
+    question: str,
+    tenant_id: int,
+    limit: int = 5,
+    embed_model: SentenceTransformer | None = None,
+    chroma_client: chromadb.PersistentClient | None = None,
+    history: list[dict] | None = None,
+) -> Iterator[dict]:
+    """
+    Classify *question*, run the appropriate tool, and yield streaming dicts:
+
+        {"type": "token",  "content": "<text>"}  — one per Ollama output token
+        {"type": "done",   "intent": "...", "sources": [...]}  — final event
+
+    *embed_model* and *chroma_client* are optional; both are created lazily when
+    not supplied (useful for CLI use; the API passes pre-loaded singletons).
+    *history* is a list of {"role": "user"|"assistant", "content": str} from the
+    session store; it is woven into the LLM prompt but NOT used for retrieval so
+    that vector similarity is based on the current question only.
+    """
+    intent = classify_intent(question)
+
+    # ── Analytics paths ───────────────────────────────────────────────────────
+    if intent in ("analytics_newest", "analytics_discount", "analytics_demand"):
+        t0 = time.monotonic()
+        if intent == "analytics_newest":
+            rows = newest_products(tenant_id, limit)
+        elif intent == "analytics_discount":
+            rows = highest_discount_products(tenant_id, limit)
+        else:
+            rows = highest_demand_products(tenant_id, limit)
+        t_sql = time.monotonic()
+        logger.info("[analytics] SQL: %.3fs, rows=%d", t_sql - t0, len(rows))
+
+        sources = [{"type": "sql", "table": "products", "rows": len(rows)}]
+
+        if not rows:
+            yield {"type": "token", "content": _no_answer_msg(tenant_id)}
+            yield {"type": "done", "intent": intent, "sources": []}
+            return
+
+        formatted = _format_analytics_answer(intent, rows)
+        t_fmt = time.monotonic()
+        logger.info("[analytics] format: %.3fs", t_fmt - t_sql)
+
+        if config.ANALYTICS_LLM_INTRO:
+            intro = _analytics_intro_sentence(question, len(rows))
+            t_llm = time.monotonic()
+            logger.info("[analytics] LLM intro: %.3fs", t_llm - t_fmt)
+            if intro:
+                yield {"type": "token", "content": intro + "\n\n"}
+
+        # Emit the Python-formatted list in small chunks to keep SSE flowing
+        _CHUNK = 120
+        for i in range(0, len(formatted), _CHUNK):
+            yield {"type": "token", "content": formatted[i:i + _CHUNK]}
+
+        yield {"type": "done", "intent": intent, "sources": sources}
+        return
+
+    # ── RAG paths ─────────────────────────────────────────────────────────────
+    if embed_model is None:
+        embed_model = SentenceTransformer(config.EMBED_MODEL)
+    if chroma_client is None:
+        chroma_client = chromadb.PersistentClient(path=config.CHROMA_DIR)
+
+    collection_name = config.COLLECTION_PRODUCTS if intent == "product_rag" else config.COLLECTION_DOCS
+    try:
+        collection = chroma_client.get_collection(collection_name)
+    except Exception:
+        yield {"type": "token", "content": _no_answer_msg(tenant_id)}
+        yield {"type": "done", "intent": intent, "sources": []}
+        return
+
+    chunks, _, metadatas, _, _ = retrieve(question, embed_model, collection, tenant_id)
+    if not chunks:
+        yield {"type": "token", "content": _no_answer_msg(tenant_id)}
+        yield {"type": "done", "intent": intent, "sources": []}
+        return
+
+    chunks = chunks[: config.MAX_CONTEXT_CHUNKS]
+    metadatas = metadatas[: config.MAX_CONTEXT_CHUNKS]
+    sources = [
+        {"source": m.get("source", "?"), "chunk_index": m.get("chunk_index", 0)}
+        for m in metadatas
+    ]
+
+    prompt = _build_rag_prompt(question, chunks, tenant_id, history)
+    for token in ask_ollama_stream(prompt):
+        yield {"type": "token", "content": token}
+    yield {"type": "done", "intent": intent, "sources": sources}
 
 
 # ── CLI smoke-test ────────────────────────────────────────────────────────────
