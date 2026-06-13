@@ -62,6 +62,21 @@ def highest_discount_products(tenant_id: int, limit: int = 5) -> list[dict]:
     return [_row_to_dict(r) for r in rows]
 
 
+def get_product_by_id(tenant_id: int, product_id: int) -> dict | None:
+    """Return a single product dict, or None if not found / not owned by tenant."""
+    with _session()() as session:
+        rows = session.execute(
+            text(
+                "SELECT id, name, price, discount_pct, category,"
+                "       created_at, demand_score, stock"
+                "  FROM products"
+                " WHERE tenant_id = :tid AND id = :pid"
+            ),
+            {"tid": tenant_id, "pid": product_id},
+        ).fetchall()
+    return _row_to_dict(rows[0]) if rows else None
+
+
 def highest_demand_products(tenant_id: int, limit: int = 5) -> list[dict]:
     """Return the *limit* products with the highest demand_score for *tenant_id*."""
     with _session()() as session:
