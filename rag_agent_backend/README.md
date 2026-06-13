@@ -99,7 +99,6 @@ python -m rag_agent.ingestion.sync_products --full   # rebuild from scratch
 ## Run the API
 
 ```bash
-# From rag_agent_backend/ so ./data and ./chroma_store resolve correctly
 uvicorn rag_agent.api:app --host 0.0.0.0 --port 8000 --reload
 ```
 
