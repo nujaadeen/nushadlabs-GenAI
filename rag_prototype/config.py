@@ -64,7 +64,7 @@ DATA_DIR = "./data"
 COLLECTION_DOCS = "rag_docs"
 
 # ChromaDB collection name for products.
-COLLECTION_PRODUCTS = "rag_products"
+COLLECTION_PRODUCTS = "products"
 
 # --- Routing mode ---
 # "hybrid" (default) — deterministic router is the front door; escalates to the

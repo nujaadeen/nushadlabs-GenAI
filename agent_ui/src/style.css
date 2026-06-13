@@ -1,0 +1,515 @@
+/* ── Reset & custom properties ──────────────────────────────────────────────── */
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  /* Palette */
+  --bg:          #0f1117;
+  --bg-pane:     #151820;
+  --bg-input:    #1c2030;
+  --border:      #272c3e;
+  --text:        #dde3f0;
+  --text-muted:  #7a849a;
+
+  /* Accent colours */
+  --blue:   #6c8ef2;
+  --blue-h: #849cf8;   /* hover */
+  --green:  #4ade80;
+  --red:    #f87171;
+  --amber:  #fbbf24;
+  --cyan:   #22d3ee;
+
+  /* Geometry */
+  --radius: 8px;
+  --header-h: 52px;
+
+  /* Typography */
+  --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  --mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', ui-monospace, monospace;
+}
+
+/* ── Base ────────────────────────────────────────────────────────────────────── */
+
+html, body {
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+/* ── Header ──────────────────────────────────────────────────────────────────── */
+
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  height: var(--header-h);
+  padding: 0 20px;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+}
+
+h1 {
+  font-size: 1rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* "local" badge next to the title */
+.badge {
+  font-size: 0.6rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  background: #222840;
+  color: var(--blue);
+  border-radius: 4px;
+  padding: 1px 6px;
+  vertical-align: middle;
+}
+
+/* Health indicator */
+.health {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.health .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  flex-shrink: 0;
+  transition: background 0.3s;
+}
+
+.health-ok  .dot        { background: var(--green); }
+.health-ok  #health-text { color: var(--green); }
+.health-err .dot        { background: var(--red); }
+.health-err #health-text { color: var(--red); }
+
+/* Bearer token input */
+.header-right input {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  padding: 6px 10px;
+  width: 230px;
+}
+
+.header-right input:focus {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+
+/* ── Main layout ─────────────────────────────────────────────────────────────── */
+
+.layout {
+  display: grid;
+  /* Left column expands; right log column is fixed at 360px */
+  grid-template-columns: 1fr 360px;
+  gap: 14px;
+  padding: 14px;
+  /* Fill the viewport below the header without a page scrollbar */
+  height: calc(100vh - var(--header-h));
+  overflow: hidden;
+}
+
+/* Left column: input + answer + tool calls */
+.col-main {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow: hidden;
+  min-width: 0;       /* let flex/grid shrink below intrinsic size */
+}
+
+/* Right column: raw SSE log */
+.col-log {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-width: 0;
+}
+
+/* Stack columns vertically on narrower viewports */
+@media (max-width: 880px) {
+  .layout {
+    grid-template-columns: 1fr;
+    height: auto;
+    overflow: visible;
+  }
+
+  body {
+    overflow-y: auto;
+  }
+
+  .col-log {
+    height: 340px;
+  }
+}
+
+/* ── Shared pane styles ───────────────────────────────────────────────────────── */
+
+.pane {
+  background: var(--bg-pane);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.pane-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 13px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .07em;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+/* Numeric badge (tool count) */
+.badge-count {
+  background: var(--blue);
+  color: #fff;
+  border-radius: 9px;
+  padding: 0 7px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  min-width: 18px;
+  text-align: center;
+  line-height: 1.6;
+}
+
+/* ── Input row ────────────────────────────────────────────────────────────────── */
+
+.input-row {
+  display: flex;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+#msg-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 0.9rem;
+  line-height: 1.5;
+  padding: 10px 13px;
+  resize: none;
+  min-height: 60px;
+}
+
+#msg-input:focus {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+
+#msg-input::placeholder {
+  color: var(--text-muted);
+}
+
+.btn-col {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+/* ── Button styles ───────────────────────────────────────────────────────────── */
+
+button {
+  border: none;
+  border-radius: var(--radius);
+  cursor: pointer;
+  font-family: var(--sans);
+  font-size: 0.85rem;
+  font-weight: 600;
+  padding: 9px 20px;
+  white-space: nowrap;
+  transition: background 0.12s, color 0.12s;
+}
+
+button:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+
+.btn-primary {
+  background: var(--blue);
+  color: #fff;
+}
+
+.btn-primary:hover {
+  background: var(--blue-h);
+}
+
+.btn-primary:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.btn-secondary {
+  background: var(--bg-input);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+}
+
+.btn-secondary:hover {
+  background: var(--border);
+  color: var(--text);
+}
+
+.btn-clear {
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  font-size: 0.68rem;
+  padding: 2px 8px;
+  border-radius: 4px;
+}
+
+.btn-clear:hover {
+  color: var(--text);
+  background: var(--bg-input);
+}
+
+/* ── Stats / session row ─────────────────────────────────────────────────────── */
+
+.meta-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  min-height: 1.2em;
+}
+
+.session-id {
+  color: var(--blue);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Answer pane ─────────────────────────────────────────────────────────────── */
+
+.answer-pane {
+  flex: 1;        /* expands to fill remaining height in col-main */
+  min-height: 100px;
+}
+
+/* The scrollable text area inside the answer pane */
+.answer-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 14px 16px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.9rem;
+  line-height: 1.7;
+}
+
+/* Blinking caret shown while the stream is active */
+.answer-body.streaming::after {
+  content: '▋';
+  display: inline;
+  color: var(--blue);
+  animation: blink 1s step-end infinite;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0; }
+}
+
+/* Respect the user's motion preference */
+@media (prefers-reduced-motion: reduce) {
+  .answer-body.streaming::after {
+    animation: none;
+    opacity: 1;
+  }
+}
+
+/* Footer: intent / tools / sources pills */
+.answer-footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 13px;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+  min-height: 0;
+}
+
+.pill {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 0.67rem;
+  border-radius: 4px;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pill-intent  { border-color: var(--blue);  color: var(--blue);  }
+.pill-tools   { border-color: var(--cyan);  color: var(--cyan);  }
+.pill-sources { border-color: var(--amber); color: var(--amber); }
+
+/* ── Tool calls pane ─────────────────────────────────────────────────────────── */
+
+.tool-pane {
+  flex-shrink: 0;   /* never compress the answer pane on behalf of tool cards */
+  max-height: 220px;
+}
+
+.tool-list {
+  overflow-y: auto;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.tool-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--cyan);
+  border-radius: 6px;
+  padding: 9px 12px;
+}
+
+.tool-name {
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: var(--cyan);
+  margin-bottom: 5px;
+}
+
+.tool-args {
+  font-family: var(--mono);
+  font-size: 0.71rem;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 90px;
+  overflow-y: auto;
+}
+
+/* ── Raw SSE log pane ────────────────────────────────────────────────────────── */
+
+.log-pane {
+  flex: 1;
+}
+
+.log-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.log-entry {
+  display: grid;
+  grid-template-columns: 65px 1fr;
+  gap: 6px;
+  align-items: baseline;
+  padding: 2px 4px;
+  border-radius: 3px;
+  font-family: var(--mono);
+  font-size: 0.68rem;
+  line-height: 1.55;
+}
+
+.log-ts {
+  color: var(--text-muted);
+  flex-shrink: 0;
+  user-select: none;
+}
+
+.log-body {
+  word-break: break-all;
+  color: var(--text-muted);
+}
+
+/* Colour-code by event type */
+.log-token      .log-body { color: var(--amber); }
+.log-tool_call  .log-body { color: var(--cyan); }
+.log-done       .log-body { color: var(--green); }
+.log-error      { background: rgba(248, 113, 113, 0.07); }
+.log-error      .log-body { color: var(--red); }
+.log-request    .log-body { color: var(--blue); }
+.log-parse-error .log-body { color: var(--red); font-style: italic; }
+
+/* ── Stream error notice ─────────────────────────────────────────────────────── */
+
+.stream-error {
+  display: block;
+  color: var(--red);
+  background: rgba(248, 113, 113, 0.09);
+  border: 1px solid rgba(248, 113, 113, 0.3);
+  border-radius: 5px;
+  padding: 9px 13px;
+  margin-top: 6px;
+  font-size: 0.85rem;
+}
+
+/* ── Accessibility ────────────────────────────────────────────────────────────── */
+
+/* Screen-reader-only label for the bearer token input */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+/* Ensure visible keyboard focus on all interactive elements */
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
