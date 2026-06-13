@@ -66,7 +66,7 @@ def populated_collection(tmp_path_factory, embed_model):
 
     with (
         patch.object(rag_config, "CHROMA_DIR", chroma_dir),
-        patch.object(rag_config, "COLLECTION_NAME", "test_isolation"),
+        patch.object(rag_config, "COLLECTION_DOCS", "test_isolation"),
         patch("ingest.load_pdf", side_effect=_fake_load_pdf),
     ):
         ingest(["t1_doc.pdf"], tenant_id=1)

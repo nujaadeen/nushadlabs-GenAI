@@ -195,7 +195,7 @@ def ingest(pdf_paths: list[str], tenant_id: int) -> None:
     print(f"[ingest] Storing in ChromaDB at '{config.CHROMA_DIR}' …")
     client = chromadb.PersistentClient(path=config.CHROMA_DIR)
     collection = client.get_or_create_collection(
-        name=config.COLLECTION_NAME,
+        name=config.COLLECTION_DOCS,
         metadata={"hnsw:space": "cosine"},
     )
 
@@ -250,7 +250,7 @@ def ingest(pdf_paths: list[str], tenant_id: int) -> None:
         total_chunks += len(chunks)
 
     print(f"\n[ingest] Done. {total_chunks} total chunks from {len(pdf_paths)} PDF(s) "
-          f"stored in collection '{config.COLLECTION_NAME}' under tenant '{tenant_id}'.")
+          f"stored in collection '{config.COLLECTION_DOCS}' under tenant '{tenant_id}'.")
 
 
 # ---------------------------------------------------------------------------
