@@ -46,7 +46,7 @@ from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 
 import config
-from router import ask_stream
+from agent import agent_stream
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -181,19 +181,22 @@ async def chat(
     tenant_id: int = Depends(_resolve_tenant),
 ):
     """
-    Stream a RAG answer for *message* scoped to the authenticated tenant.
+    Stream an agent answer for *message* scoped to the authenticated tenant.
 
     Response is Server-Sent Events (SSE).  Each event is a JSON object:
 
-        {"type": "token",  "content": "<text fragment>"}
-        {"type": "done",   "intent": "<label>", "sources": [...], "session_id": "<id>"}
-        {"type": "error",  "message": "<description>"}   ← only on failure
+        {"type": "token",     "content": "<text fragment>"}
+        {"type": "tool_call", "tool": "<name>", "args": {...}}   ← optional, for UI
+        {"type": "done",      "intent": "agent", "sources": [...],
+                              "tools_called": [...], "session_id": "<id>"}
+        {"type": "error",     "message": "<description>"}        ← only on failure
 
-    *intent* is one of: doc_rag | product_rag | analytics_newest |
-                        analytics_discount | analytics_demand
+    *sources* is a list of cited sources; shape varies by tool:
+        SQL tools  → {"type": "sql", "table": "products", "rows": <int>}
+        RAG tools  → {"source": "<file>", "chunk_index": <int>}
 
-    *sources* for RAG paths is a list of {"source": "<file>", "chunk_index": <int>};
-    for analytics paths it is [{"type": "sql", "table": "products", "rows": <int>}].
+    *tools_called* lists every tool the agent invoked:
+        [{"tool": "<name>", "args": {...}}, ...]
     """
     session_id = req.session_id or str(uuid.uuid4())
     history = _get_history(session_id)
@@ -207,13 +210,14 @@ async def chat(
         full_answer = ""
         intent = "unknown"
         sources: list[dict] = []
+        tools_called: list[dict] = []
 
         try:
-            # ask_stream is a synchronous generator (urllib + ChromaDB).
-            # We drive it one step at a time via run_in_executor so the event
-            # loop remains free between Ollama tokens.
+            # agent_stream is a synchronous generator (urllib + ChromaDB).
+            # Drive it one step at a time via run_in_executor so the event
+            # loop stays free between LLM tokens and tool calls.
             loop = asyncio.get_event_loop()
-            sync_gen = ask_stream(
+            sync_gen = agent_stream(
                 req.message,
                 tenant_id,
                 embed_model=embed_model,
@@ -234,9 +238,15 @@ async def chat(
                 if chunk["type"] == "token":
                     full_answer += chunk["content"]
                     yield f"data: {json.dumps({'type': 'token', 'content': chunk['content']})}\n\n"
+                elif chunk["type"] == "tool_call":
+                    # Forward tool-call events so the frontend can optionally
+                    # display "thinking…" steps. Unknown event types are safe
+                    # to ignore on clients that only handle token/done.
+                    yield f"data: {json.dumps(chunk)}\n\n"
                 elif chunk["type"] == "done":
                     intent = chunk["intent"]
-                    sources = chunk["sources"]
+                    sources = chunk.get("sources", [])
+                    tools_called = chunk.get("tools_called", [])
 
         except Exception as exc:
             logger.exception("Stream error for tenant=%d session=%s", tenant_id, session_id)
@@ -244,7 +254,7 @@ async def chat(
 
         _append_turn(session_id, "assistant", full_answer)
         yield (
-            f"data: {json.dumps({'type': 'done', 'intent': intent, 'sources': sources, 'session_id': session_id})}\n\n"
+            f"data: {json.dumps({'type': 'done', 'intent': intent, 'sources': sources, 'tools_called': tools_called, 'session_id': session_id})}\n\n"
         )
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
