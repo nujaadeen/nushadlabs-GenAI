@@ -1,21 +1,29 @@
 """
-router.py — Intent-aware query router.
+router.py — Intent-aware query router (hybrid front door).
 
-Given a question and a tenant_id, classifies the intent into one of:
+Classifies a question into one of:
 
     doc_rag            → semantic search over PDF docs  (ChromaDB rag_docs)
     product_rag        → semantic search over products  (ChromaDB products)
     analytics_newest   → newest_products() SQL query
     analytics_discount → highest_discount_products() SQL query
     analytics_demand   → highest_demand_products() SQL query
+    agent              → multi-step question; escalated to agent_stream
 
 Classification order:
-    1. Keyword fast-path (zero latency, covers the obvious cases)
-    2. Ollama LLM with a tight classification prompt
-    3. Default fallback → doc_rag
+    1. Multi-step heuristic  (zero latency, catches compound/compare questions)
+    2. Single-shot keyword patterns  (zero latency, existing analytics signals)
+    3. Ollama LLM classifier  (tight prompt, num_predict=12)
+    4. Default fallback → doc_rag
 
-Entry point:
-    ask(question, tenant_id, limit=5) -> str
+Routing is controlled by config.ROUTER_MODE:
+    "hybrid"  — this file is the front door; escalates to agent on "agent" intent
+    "router"  — never escalates; "agent" falls back to product_rag
+    "agent"   — bypasses classification; everything goes straight to agent_stream
+
+Entry points:
+    ask(question, tenant_id, limit=5) -> str          (blocking, CLI)
+    ask_stream(question, tenant_id, ...)  -> Iterator  (SSE, used by api.py)
 """
 
 import json
@@ -46,7 +54,34 @@ _LABELS = (
     "analytics_newest",
     "analytics_discount",
     "analytics_demand",
+    "agent",
 )
+
+# ── Multi-step heuristic (checked before single-shot keyword patterns) ────────
+# Conservative — fires only on clear compound/compare signals.
+# When unsure, we do NOT match here; LLM classify or single-shot keyword wins.
+
+_MULTISTEP_PATTERN = re.compile(
+    # explicit comparison request
+    r"\bcompare\b"
+    # "of the/our/my X … which …" — cross-list reasoning
+    r"|of\s+(?:the|our|my|your|those|them|these)\b.{1,60}?\bwhich\b"
+    # two distinct actions joined by "and": "find a laptop and tell me its discount"
+    r"|\band\b.{0,50}\b(?:tell|give|compare|check|rank|sort|which\s+is|what\s+is|how\s+(?:much|many))\b"
+    # sequential steps: "… then find / show / compare …"
+    r"|\bthen\b.{0,40}\b(?:find|get|show|tell|give|compare|check|rank|sort)\b"
+    # "both … product/price/…" — dual-item questions
+    r"|\bboth\b.{0,60}\b(?:product|item|price|stock|discount|newest|latest|popular|demand)\b",
+    re.I,
+)
+
+
+def _multistep_classify(question: str) -> str | None:
+    """Return 'agent' if the question contains obvious multi-step cues, else None."""
+    if _MULTISTEP_PATTERN.search(question):
+        return "agent"
+    return None
+
 
 # ── Keyword fast-path ─────────────────────────────────────────────────────────
 # Ordered from most-specific to least-specific to avoid false matches.
@@ -89,6 +124,9 @@ Labels:
   analytics_newest   — newest / most recently added products
   analytics_discount — products with the biggest discounts or lowest prices
   analytics_demand   — most popular / highest-demand / best-selling products
+  agent              — questions needing MORE THAN ONE lookup, e.g. "of the newest
+                       products which is cheapest", "compare product 12 and 30",
+                       "find a laptop and tell me its discount"
 
 Question: {question}
 Label:"""
@@ -135,12 +173,22 @@ def _llm_classify(question: str) -> str | None:
 def classify_intent(question: str) -> str:
     """
     Return the intent label for *question*.
-    Tries keyword patterns first, then LLM, then defaults to doc_rag.
-    Always logs the chosen intent and the path that produced it.
+
+    Order:
+      1. Multi-step heuristic  → "agent"  (conservative; compound cues only)
+      2. Single-shot keywords  → analytics_* labels
+      3. LLM classifier        → any label including "agent"
+      4. Default               → "doc_rag"
     """
+    label = _multistep_classify(question)
+    if label:
+        logger.info("[router] intent=%-20s  path=multistep  question=%r", label, question)
+        print(f"[router] intent={label}  (multi-step heuristic)")
+        return label
+
     label = _keyword_classify(question)
     if label:
-        logger.info("[router] intent=%-20s  path=keyword   question=%r", label, question)
+        logger.info("[router] intent=%-20s  path=keyword    question=%r", label, question)
         print(f"[router] intent={label}  (keyword match)")
         return label
 
@@ -329,7 +377,24 @@ def ask(question: str, tenant_id: int, limit: int = 5) -> str:
     a natural-language answer.  Prints the chosen intent so the caller can see
     which path was taken.
     """
-    intent = classify_intent(question)
+    from agent import agent_stream  # local import avoids a potential circular ref
+
+    intent = "agent" if config.ROUTER_MODE == "agent" else classify_intent(question)
+
+    # ── Agent path ────────────────────────────────────────────────────────────
+    if intent == "agent":
+        if config.ROUTER_MODE in ("hybrid", "agent"):
+            print("[router] intent=agent → running agent_stream (CLI collect mode)")
+            model = SentenceTransformer(config.EMBED_MODEL)
+            chroma = chromadb.PersistentClient(path=config.CHROMA_DIR)
+            tokens = [
+                chunk["content"]
+                for chunk in agent_stream(question, tenant_id, model, chroma, limit=limit)
+                if chunk["type"] == "token"
+            ]
+            return "".join(tokens)
+        else:  # ROUTER_MODE="router" — fall back to product_rag
+            intent = "product_rag"
 
     # ── Analytics paths (SQL, no embeddings) ─────────────────────────────────
     if intent == "analytics_newest":
@@ -391,7 +456,44 @@ def ask_stream(
     session store; it is woven into the LLM prompt but NOT used for retrieval so
     that vector similarity is based on the current question only.
     """
+    from agent import agent_stream  # local import avoids a potential circular ref
+
+    # ── ROUTER_MODE="agent" — bypass classification entirely ──────────────────
+    if config.ROUTER_MODE == "agent":
+        if embed_model is None:
+            embed_model = SentenceTransformer(config.EMBED_MODEL)
+        if chroma_client is None:
+            chroma_client = chromadb.PersistentClient(path=config.CHROMA_DIR)
+        yield from agent_stream(
+            question, tenant_id,
+            embed_model=embed_model,
+            chroma_client=chroma_client,
+            history=history,
+            limit=limit,
+        )
+        return
+
     intent = classify_intent(question)
+
+    # ── "agent" intent — escalate or fall back depending on ROUTER_MODE ───────
+    if intent == "agent":
+        if config.ROUTER_MODE == "hybrid":
+            logger.info("[router] intent=agent → escalating to agent_stream")
+            print("[router] intent=agent → escalating to agent_stream")
+            if embed_model is None:
+                embed_model = SentenceTransformer(config.EMBED_MODEL)
+            if chroma_client is None:
+                chroma_client = chromadb.PersistentClient(path=config.CHROMA_DIR)
+            yield from agent_stream(
+                question, tenant_id,
+                embed_model=embed_model,
+                chroma_client=chroma_client,
+                history=history,
+                limit=limit,
+            )
+            return
+        else:  # ROUTER_MODE="router" — no escalation; treat as product_rag
+            intent = "product_rag"
 
     # ── Analytics paths ───────────────────────────────────────────────────────
     if intent in ("analytics_newest", "analytics_discount", "analytics_demand"):
