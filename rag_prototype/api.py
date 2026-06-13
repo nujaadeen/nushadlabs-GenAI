@@ -46,7 +46,7 @@ from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 
 import config
-from agent import agent_stream
+from router import ask_stream
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -213,11 +213,11 @@ async def chat(
         tools_called: list[dict] = []
 
         try:
-            # agent_stream is a synchronous generator (urllib + ChromaDB).
-            # Drive it one step at a time via run_in_executor so the event
-            # loop stays free between LLM tokens and tool calls.
+            # ask_stream is a synchronous generator. It handles ROUTER_MODE
+            # internally — routing to analytics/RAG or escalating to the agent.
+            # Drive it via run_in_executor so the event loop stays free.
             loop = asyncio.get_event_loop()
-            sync_gen = agent_stream(
+            sync_gen = ask_stream(
                 req.message,
                 tenant_id,
                 embed_model=embed_model,

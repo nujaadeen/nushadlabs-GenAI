@@ -66,6 +66,13 @@ COLLECTION_DOCS = "rag_docs"
 # ChromaDB collection name for products.
 COLLECTION_PRODUCTS = "rag_products"
 
+# --- Routing mode ---
+# "hybrid" (default) — deterministic router is the front door; escalates to the
+#                      tool-using agent only when intent == "agent".
+# "router"           — never escalate; "agent" intent falls back to product_rag.
+# "agent"            — bypass the router entirely; every query goes to agent_stream.
+ROUTER_MODE = "hybrid"
+
 # --- Analytics formatting ---
 # When True, ask the LLM for a one-line intro before the Python-formatted list.
 # When False (default), skip the LLM entirely — SQL + Python format only (<1 s).
