@@ -91,6 +91,9 @@ def _chroma_metadata(p: Product) -> dict:
     return {
         "tenant_id":    int(p.tenant_id),
         "product_id":   int(p.id),
+        "product_name": str(p.name),
+        "source":       "products_db",
+        "chunk_index":  0,
         "price":        float(p.price),
         "discount_pct": float(p.discount_pct),
         "category":     str(p.category),

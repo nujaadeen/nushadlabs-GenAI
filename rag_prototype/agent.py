@@ -258,12 +258,19 @@ def _execute_tool(
         chunks, _, metas, _, _ = retrieve(
             args["query"], embed_model, col, tenant_id, n_results=limit
         )
-        return json.dumps({
-            "results": [
-                {"text": c, "source": m.get("source", "?"), "chunk_index": m.get("chunk_index", 0)}
-                for c, m in zip(chunks, metas)
-            ]
-        })
+        results = []
+        for c, m in zip(chunks, metas):
+            entry: dict = {
+                "text": c,
+                "source": m.get("source", "?"),
+                "chunk_index": m.get("chunk_index", 0),
+            }
+            if "product_name" in m:
+                entry["product_name"] = m["product_name"]
+            if "product_id" in m:
+                entry["product_id"] = m["product_id"]
+            results.append(entry)
+        return json.dumps({"results": results})
 
     if name == "newest_products":
         return json.dumps({"products": _sql_newest(tenant_id, limit)})
@@ -298,10 +305,18 @@ def _extract_sources(tool_name: str, result_str: str) -> list[dict]:
         p = r.get("product")
         return [{"type": "sql", "table": "products", "id": p["id"], "name": p["name"]}] if p else []
     if tool_name in ("doc_search", "product_search"):
-        return [
-            {"source": res.get("source", "?"), "chunk_index": res.get("chunk_index", 0)}
-            for res in r.get("results", [])
-        ]
+        entries = []
+        for res in r.get("results", []):
+            entry: dict = {
+                "source": res.get("source", "?"),
+                "chunk_index": res.get("chunk_index", 0),
+            }
+            if "product_name" in res:
+                entry["product_name"] = res["product_name"]
+            if "product_id" in res:
+                entry["product_id"] = res["product_id"]
+            entries.append(entry)
+        return entries
     return []
 
 
