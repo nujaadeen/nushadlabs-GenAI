@@ -5,6 +5,7 @@ Classifies a question into one of:
 
     doc_rag            → semantic search over PDF docs  (ChromaDB rag_docs)
     product_rag        → semantic search over products  (ChromaDB products)
+    product_lookup     → precise field (stock/price) for a NAMED product — SQL only
     analytics_newest   → newest_products() SQL query
     analytics_discount → highest_discount_products() SQL query
     analytics_demand   → highest_demand_products() SQL query
@@ -39,6 +40,7 @@ from sentence_transformers import SentenceTransformer
 import config
 from query import ask_ollama, ask_ollama_stream, retrieve
 from tools.analytics import (
+    find_products_by_name,
     highest_demand_products,
     highest_discount_products,
     newest_products,
@@ -51,11 +53,63 @@ logger = logging.getLogger(__name__)
 _LABELS = (
     "doc_rag",
     "product_rag",
+    "product_lookup",
     "analytics_newest",
     "analytics_discount",
     "analytics_demand",
     "agent",
 )
+
+# ── Product-lookup heuristic (checked FIRST — highest specificity) ────────────
+# Matches questions asking for a PRECISE FIELD (stock / price) of a NAMED product.
+# Returns "product_lookup" when a name is extractable, "agent" when field cues
+# are present but the name is unclear (to avoid falling through to product_rag).
+
+_FIELD_CUE_PATTERN = re.compile(
+    r'\b(?:how\s+many|how\s+much|price\s+of|cost\s+of|stock\s+of|quantity\s+of|in\s+stock)\b',
+    re.I,
+)
+
+# Ordered from most-specific to least-specific; first match wins.
+_NAME_EXTRACT_PATTERNS = [
+    re.compile(r'\bhow\s+many\s+(.+?)\s+(?:are|is)\s+(?:in\s*stock|left|there)\b', re.I),
+    re.compile(r'\bhow\s+many\s+(.+?)(?:\s+(?:do|does|are|is)\b|\s*\?|$)', re.I),
+    re.compile(r'\bhow\s+much\s+does\s+(.+?)\s+cost\b', re.I),
+    re.compile(r'\bhow\s+much\s+(.+?)\s+(?:do\s+(?:we|you)\s+have|is\s+left|is\s+in\s+stock)\b', re.I),
+    re.compile(r'\b(?:price|cost)\s+of\s+(.+?)(?:\s*\?|$)', re.I),
+    re.compile(r'\b(?:stock|quantity)\s+of\s+(.+?)(?:\s*\?|$)', re.I),
+    re.compile(r'\b(?:is|are)\s+(.+?)\s+in\s*stock\b', re.I),
+    re.compile(r'\bwhat\s+(?:is|are)\s+(?:the\s+)?(?:price|cost|stock|quantity)\s+(?:of|for)\s+(.+?)(?:\s*\?|$)', re.I),
+    re.compile(r'^(.+?)\s+in\s*stock\s*\??$', re.I),
+]
+
+# Trailing noise to strip from a captured name
+_NAME_CLEANUP = re.compile(r'\s+(?:please|now|today)\s*$', re.I)
+
+
+def _extract_product_name(question: str) -> str | None:
+    """Try to extract a product name from a field-query question. Returns None if unclear."""
+    for pattern in _NAME_EXTRACT_PATTERNS:
+        m = pattern.search(question)
+        if m:
+            name = m.group(1).strip().rstrip('?').strip()
+            name = _NAME_CLEANUP.sub('', name).strip()
+            if len(name) > 2:
+                return name
+    return None
+
+
+def _product_lookup_classify(question: str) -> str | None:
+    """Return 'product_lookup' when a field + name are clear, 'agent' when
+    field cues exist but the product name is ambiguous, None if no field cues."""
+    if not _FIELD_CUE_PATTERN.search(question):
+        return None
+    name = _extract_product_name(question)
+    if name:
+        return "product_lookup"
+    # Field cues present but name unclear → agent handles it via get_product_by_id
+    return "agent"
+
 
 # ── Multi-step heuristic (checked before single-shot keyword patterns) ────────
 # Conservative — fires only on clear compound/compare signals.
@@ -119,6 +173,8 @@ _CLASSIFY_PROMPT = """\
 Classify the user question into exactly one label. Output ONLY the label, nothing else.
 
 Labels:
+  product_lookup     — stock count, price, or availability of a SPECIFIC NAMED product,
+                       e.g. "how many Organic Baby Spinach are in stock", "price of Fresh Milk"
   doc_rag            — company policy, contracts, terms, documentation, business rules
   product_rag        — product recommendation, description, comparison, or search
   analytics_newest   — newest / most recently added products
@@ -175,11 +231,18 @@ def classify_intent(question: str) -> str:
     Return the intent label for *question*.
 
     Order:
-      1. Multi-step heuristic  → "agent"  (conservative; compound cues only)
-      2. Single-shot keywords  → analytics_* labels
-      3. LLM classifier        → any label including "agent"
-      4. Default               → "doc_rag"
+      1. Product-lookup heuristic → "product_lookup" / "agent"  (highest specificity)
+      2. Multi-step heuristic     → "agent"  (conservative; compound cues only)
+      3. Single-shot keywords     → analytics_* labels
+      4. LLM classifier           → any label including "agent"
+      5. Default                  → "doc_rag"
     """
+    label = _product_lookup_classify(question)
+    if label:
+        logger.info("[router] intent=%-20s  path=product_lookup_heuristic  question=%r", label, question)
+        print(f"[router] intent={label}  (product-lookup heuristic)")
+        return label
+
     label = _multistep_classify(question)
     if label:
         logger.info("[router] intent=%-20s  path=multistep  question=%r", label, question)
@@ -224,6 +287,32 @@ def _no_answer_msg(tenant_id: int) -> str:
         "For further assistance, please contact our customer care team or send your "
         "enquiry via email and we'll be happy to help you."
     )
+
+
+# ── Product-lookup formatting (Python-only, no LLM) ──────────────────────────
+
+
+def _format_product_lookup_answer(rows: list[dict]) -> str:
+    """Format ILIKE product-lookup results as plain text — no LLM."""
+    if not rows:
+        return ""
+    if len(rows) == 1:
+        p = rows[0]
+        date = p["created_at"][:10] if p["created_at"] else "unknown"
+        disc = f", {p['discount_pct']:.0f}% off" if p["discount_pct"] else ""
+        return (
+            f"{p['name']}: ${p['price']:.2f}{disc}, "
+            f"{p['stock']} in stock, added {date}."
+        )
+    lines = [f"Found {len(rows)} matching products:"]
+    for i, p in enumerate(rows, 1):
+        date = p["created_at"][:10] if p["created_at"] else "unknown"
+        disc = f", {p['discount_pct']:.0f}% off" if p["discount_pct"] else ""
+        lines.append(
+            f"{i}. {p['name']} — ${p['price']:.2f}{disc},"
+            f" {p['stock']} in stock, added {date}"
+        )
+    return "\n".join(lines)
 
 
 # ── Analytics formatting (Python-only, no LLM) ───────────────────────────────
@@ -309,10 +398,10 @@ def _rag_system_prompt(tenant_id: int) -> str:
     return (
         f"{intro} "
         "Answer the user's question using ONLY the context provided below. "
+        "Answer in plain prose. "
+        "Do NOT mention chunk numbers, do NOT output any (source: ...) string, "
+        "and do NOT include angle-bracket placeholders. "
         "Keep your answer concise.\n\n"
-        "CITATION RULE: For every factual claim that involves a specific number, name, or date, "
-        "quote the exact sentence from the context that supports it, in the form: "
-        "Answer ... (source: \"<exact quoted sentence from context>\"). "
         f"If the context does not contain enough information to answer, reply with exactly:\n"
         f"\"{no_answer}\"\n"
         "Do NOT infer, estimate, or guess — only report what the context explicitly states."
@@ -395,6 +484,15 @@ def ask(question: str, tenant_id: int, limit: int = 5) -> str:
             return "".join(tokens)
         else:  # ROUTER_MODE="router" — fall back to product_rag
             intent = "product_rag"
+
+    # ── Product-lookup path (SQL ILIKE, no embeddings) ───────────────────────
+    if intent == "product_lookup":
+        name = _extract_product_name(question) or question
+        rows = find_products_by_name(tenant_id, name)
+        print(f"[router] SQL product_lookup: name={name!r}, rows={len(rows)}")
+        if not rows:
+            return _no_answer_msg(tenant_id)
+        return _format_product_lookup_answer(rows)
 
     # ── Analytics paths (SQL, no embeddings) ─────────────────────────────────
     if intent == "analytics_newest":
@@ -495,6 +593,23 @@ def ask_stream(
         else:  # ROUTER_MODE="router" — no escalation; treat as product_rag
             intent = "product_rag"
 
+    # ── Product-lookup path (SQL ILIKE, no embeddings) ───────────────────────
+    if intent == "product_lookup":
+        name = _extract_product_name(question) or question
+        logger.info("[router] product_lookup: name=%r", name)
+        rows = find_products_by_name(tenant_id, name)
+        sources = [{"type": "sql", "table": "products", "rows": len(rows)}]
+        if not rows:
+            yield {"type": "token", "content": _no_answer_msg(tenant_id)}
+            yield {"type": "done", "intent": intent, "sources": []}
+            return
+        answer = _format_product_lookup_answer(rows)
+        _CHUNK = 120
+        for i in range(0, len(answer), _CHUNK):
+            yield {"type": "token", "content": answer[i:i + _CHUNK]}
+        yield {"type": "done", "intent": intent, "sources": sources}
+        return
+
     # ── Analytics paths ───────────────────────────────────────────────────────
     if intent in ("analytics_newest", "analytics_discount", "analytics_demand"):
         t0 = time.monotonic()
@@ -555,10 +670,17 @@ def ask_stream(
 
     chunks = chunks[: config.MAX_CONTEXT_CHUNKS]
     metadatas = metadatas[: config.MAX_CONTEXT_CHUNKS]
-    sources = [
-        {"source": m.get("source", "?"), "chunk_index": m.get("chunk_index", 0)}
-        for m in metadatas
-    ]
+    sources = []
+    for m in metadatas:
+        entry: dict = {
+            "source": m.get("source", "?"),
+            "chunk_index": m.get("chunk_index", 0),
+        }
+        if "product_name" in m:
+            entry["product_name"] = m["product_name"]
+        if "product_id" in m:
+            entry["product_id"] = m["product_id"]
+        sources.append(entry)
 
     prompt = _build_rag_prompt(question, chunks, tenant_id, history)
     for token in ask_ollama_stream(prompt):

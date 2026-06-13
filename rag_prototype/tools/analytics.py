@@ -28,6 +28,24 @@ def _row_to_dict(row) -> dict:
     }
 
 
+def find_products_by_name(tenant_id: int, name_query: str, limit: int = 5) -> list[dict]:
+    """Return products whose name contains *name_query* (case-insensitive, tenant-scoped)."""
+    with _session()() as session:
+        rows = session.execute(
+            text(
+                "SELECT id, name, price, discount_pct, category,"
+                "       created_at, demand_score, stock"
+                "  FROM products"
+                " WHERE tenant_id = :tid"
+                "   AND name ILIKE :q"
+                " ORDER BY name"
+                " LIMIT :lim"
+            ),
+            {"tid": tenant_id, "q": f"%{name_query}%", "lim": limit},
+        ).fetchall()
+    return [_row_to_dict(r) for r in rows]
+
+
 def newest_products(tenant_id: int, limit: int = 5) -> list[dict]:
     """Return the *limit* most recently created products for *tenant_id*."""
     with _session()() as session:
